@@ -1,0 +1,3 @@
+adafruit-circuitpython-motor
+adafruit-circuitpython-asyncio
+adafruit-circuitpython-ticks

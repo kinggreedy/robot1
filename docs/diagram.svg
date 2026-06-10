@@ -1,0 +1,114 @@
+<svg width="48cm" height="38cm" viewBox="0 0 480 380" xmlns="http://www.w3.org/2000/svg">
+
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="gray"/>
+    </marker>
+  </defs>
+
+  <!-- BACK VIEW -->
+  <text x="140" y="22" font-size="8" text-anchor="middle">BACK</text>
+
+  <g transform="translate(80,40)">
+    <rect x="0" y="25" width="120" height="5"
+          fill="none" stroke="black" stroke-width="2"/>
+
+    <line x1="30" y1="30" x2="30" y2="55"
+          stroke="red" stroke-width="3"/>
+    <line x1="90" y1="30" x2="90" y2="55"
+          stroke="red" stroke-width="3"/>
+
+    <line x1="-15" y1="15" x2="-15" y2="55"
+          stroke="black" stroke-width="4" stroke-linecap="round"/>
+    <line x1="135" y1="15" x2="135" y2="55"
+          stroke="black" stroke-width="4" stroke-linecap="round"/>
+
+    <line x1="-40" y1="55" x2="160" y2="55"
+          stroke="gray" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <line x1="0" y1="90" x2="120" y2="90"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="60" y="85" font-size="6" text-anchor="middle" fill="gray">12 cm</text>
+  </g>
+
+
+  <!-- RIGHT VIEW -->
+  <text x="340" y="22" font-size="8" text-anchor="middle">RIGHT</text>
+
+  <g transform="translate(270,40)">
+    <rect x="0" y="25" width="160" height="5"
+          fill="none" stroke="black" stroke-width="2"/>
+
+    <line x1="25" y1="30" x2="25" y2="55"
+          stroke="red" stroke-width="3"/>
+
+    <circle cx="100" cy="35" r="20"
+            fill="none" stroke="black" stroke-width="2"/>
+    <circle cx="100" cy="35" r="2" fill="black"/>
+
+    <line x1="-10" y1="55" x2="170" y2="55"
+          stroke="gray" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <line x1="0" y1="90" x2="160" y2="90"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="80" y="85" font-size="6" text-anchor="middle" fill="gray">16 cm</text>
+
+    <line x1="100" y1="15" x2="100" y2="55"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="112" y="38" font-size="6" fill="gray">Ø4 cm</text>
+
+    <line x1="160" y1="35" x2="100" y2="35"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="130" y="29" font-size="6" text-anchor="middle" fill="gray">6 cm</text>
+
+    <text x="38" y="48" font-size="6" fill="gray">pole 2.5 cm</text>
+    <text x="60" y="22" font-size="6" fill="gray">board 5 mm</text>
+    <text x="105" y="12" font-size="6" fill="gray">5 mm undermount</text>
+  </g>
+
+
+  <!-- TOP VIEW -->
+  <text x="140" y="167" font-size="8" text-anchor="middle">TOP</text>
+  <text x="140" y="178" font-size="7" text-anchor="middle">FACE</text>
+
+  <g transform="translate(80,185)">
+    <polygon
+      points="0,25 0,135 25,160 95,160 120,135 120,25 95,0 25,0"
+      fill="none" stroke="black" stroke-width="2"/>
+
+    <circle cx="30" cy="25" r="3" fill="red"/>
+    <circle cx="90" cy="25" r="3" fill="red"/>
+
+    <line x1="-15" y1="80" x2="-15" y2="120"
+          stroke="black" stroke-width="4" stroke-linecap="round"/>
+    <line x1="135" y1="80" x2="135" y2="120"
+          stroke="black" stroke-width="4" stroke-linecap="round"/>
+
+    <line x1="0" y1="185" x2="120" y2="185"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="60" y="180" font-size="6" text-anchor="middle" fill="gray">12 cm</text>
+
+    <line x1="25" y1="205" x2="95" y2="205"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="60" y="200" font-size="6" text-anchor="middle" fill="gray">7 cm inner</text>
+
+    <line x1="30" y1="15" x2="90" y2="15"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="60" y="10" font-size="6" text-anchor="middle" fill="gray">
+      poles: 3 cm / 9 cm
+    </text>
+
+    <line x1="-15" y1="120" x2="0" y2="120"
+          stroke="gray" stroke-width="1"
+          marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="-8" y="132" font-size="6" text-anchor="middle" fill="gray">1.5 cm</text>
+  </g>
+
+</svg>

@@ -1,0 +1,16 @@
+photodiode
+color sensor (+ gesture)
+IMU
+camera
+ultrasonic range  (probably 10 cm?)
+colored tape
+magnets + sensor (Hall)
+speaker + microphones
+
+----
+
+UF2 Bootloader v1.0
+Model: Raspberry Pi RP2350
+Board-ID: RP2350
+
+STEP MOTOR ROHS 28BYJ-48

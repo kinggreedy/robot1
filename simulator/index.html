@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autonomous Docking Simulator | Gridbot Sandbox</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+    <!-- Header Navigation -->
+    <header>
+        <div class="header-brand">
+            <h1>🤖 Autonomous Docking Simulator <span>Task 1</span></h1>
+        </div>
+        <div class="header-status">
+            <span id="header-status-label" class="value-display">Ready</span>
+        </div>
+    </header>
+
+    <!-- Dashboard Content Layout -->
+    <main class="dashboard-grid">
+        
+        <!-- Left Panel: Simulator Settings -->
+        <section class="panel">
+            <div class="panel-header">
+                <h2>Control Panel</h2>
+            </div>
+            
+            <div class="panel-content">
+                <!-- Algorithm Selection -->
+                <div class="control-group">
+                    <label for="algo-select">Select Algorithm</label>
+                    <select id="algo-select">
+                        <option value="straight" selected>1. Straight Walk (Baseline)</option>
+                        <option value="random">2. Random Walk (Search Baseline)</option>
+                        <option value="rotate_scan">3. Rotate-Scan then Drive</option>
+                    </select>
+                </div>
+                
+                <!-- Noise Toggle Switch -->
+                <div class="toggle-container">
+                    <label for="noise-toggle" style="cursor:pointer;">Enable Physics Noise</label>
+                    <label class="switch">
+                        <input type="checkbox" id="noise-toggle">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                
+                <!-- Section: Geometries -->
+                <h3 class="section-title">Target Geometry</h3>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="target-w">Target Width</label>
+                        <span id="target-w-val" class="value-display">5 cm</span>
+                    </div>
+                    <input type="range" id="target-w" min="1" max="9" step="0.5" value="5">
+                </div>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="target-h">Target Length</label>
+                        <span id="target-h-val" class="value-display">5 cm</span>
+                    </div>
+                    <input type="range" id="target-h" min="1" max="9" step="0.5" value="5">
+                </div>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="target-rot">Target Rotation</label>
+                        <span id="target-rot-val" class="value-display">0°</span>
+                    </div>
+                    <input type="range" id="target-rot" min="-180" max="180" step="5" value="0">
+                </div>
+                
+                <!-- Section: Noise & Slip Variables -->
+                <h3 class="section-title">Noise Parameters</h3>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="noise-pos">Position Drift / step</label>
+                        <span id="noise-pos-val" class="value-display">0.1 cm</span>
+                    </div>
+                    <input type="range" id="noise-pos" min="0" max="1" step="0.05" value="0.1">
+                </div>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="noise-heading">Heading Drift / step</label>
+                        <span id="noise-heading-val" class="value-display">0.5°</span>
+                    </div>
+                    <input type="range" id="noise-heading" min="0" max="5" step="0.1" value="0.5">
+                </div>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="noise-slip">Max Wheel Slip</label>
+                        <span id="noise-slip-val" class="value-display">10%</span>
+                    </div>
+                    <input type="range" id="noise-slip" min="0" max="50" step="5" value="10">
+                </div>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="noise-turn-err">Rotational Error</label>
+                        <span id="noise-turn-err-val" class="value-display">10%</span>
+                    </div>
+                    <input type="range" id="noise-turn-err" min="0" max="50" step="5" value="10">
+                </div>
+                
+                <div class="control-group">
+                    <div class="control-group-header">
+                        <label for="noise-stop-delay">Braking Delay</label>
+                        <span id="noise-stop-delay-val" class="value-display">0.1 s</span>
+                    </div>
+                    <input type="range" id="noise-stop-delay" min="0" max="1" step="0.05" value="0.1">
+                </div>
+            </div>
+        </section>
+        
+        <!-- Center Panel: Live Visualization Sandbox -->
+        <section class="center-panel">
+            <div class="arena-container">
+                <!-- 2D Physics Canvas -->
+                <canvas id="arena" width="600" height="600"></canvas>
+                
+                <!-- Overlay HUD Telemetry -->
+                <div class="hud">
+                    <div>Time:</div><span id="hud-time">0.00</span>
+                    <div>Pos (X,Y):</div><span><span id="hud-x">0.0</span>, <span id="hud-y">0.0</span> cm</span>
+                    <div>Heading:</div><span><span id="hud-heading">0</span>°</span>
+                    <div>Tgt Dist:</div><span id="hud-dist">---</span>
+                    <div>Tgt Angle:</div><span><span id="hud-angle">---</span>°</span>
+                    <div>Coverage:</div><span><span id="hud-coverage">0.0</span>%</span>
+                    <div>Score:</div><span id="hud-score">0</span>
+                    <div>Visible:</div><span id="hud-visible">NO</span>
+                    <div>Under Base:</div><span id="hud-under">NO</span>
+                </div>
+                
+                <!-- HUD Termination Alert Banner -->
+                <div id="hud-alert" class="hud-alert">TERMINATED</div>
+            </div>
+            
+            <!-- Controls Bar -->
+            <div class="vis-controls">
+                <div class="control-buttons">
+                    <button id="play-btn" class="btn btn-success">▶ Play</button>
+                    <button id="step-btn" class="btn">⏭ Step</button>
+                    <button id="reset-btn" class="btn">🔄 Reset</button>
+                </div>
+                
+                <div class="speed-selector">
+                    <button id="speed-1x" class="speed-btn active">1x</button>
+                    <button id="speed-2x" class="speed-btn">2x</button>
+                    <button id="speed-5x" class="speed-btn">5x</button>
+                    <button id="speed-max" class="speed-btn">Max</button>
+                </div>
+            </div>
+        </section>
+        
+        <!-- Right Panel: Batch Testing & Performance Metrics -->
+        <section class="panel">
+            <div class="panel-header">
+                <h2>Batch Simulation</h2>
+            </div>
+            
+            <div class="panel-content">
+                <!-- Trials Selector Cards -->
+                <div class="control-group">
+                    <label>Batch Size (Trials)</label>
+                    <div class="batch-trials-options">
+                        <div id="trials-100" class="trial-option active">
+                            <span>100</span>
+                            <label>Quick Run</label>
+                        </div>
+                        <div id="trials-1000" class="trial-option">
+                            <span>1,000</span>
+                            <label>Statistical</label>
+                        </div>
+                        <div id="trials-10000" class="trial-option">
+                            <span>10,000</span>
+                            <label>Thorough</label>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Run Button -->
+                <button id="run-batch-btn" class="btn btn-success" style="width: 100%; padding: 0.85rem;">
+                    🚀 Run Batch Simulation
+                </button>
+                
+                <!-- Progress Indicator (Hidden on start) -->
+                <div id="progress-container" class="progress-container">
+                    <div class="progress-label">
+                        <span id="progress-label-text">Running trials...</span>
+                    </div>
+                    <div class="progress-bar-bg">
+                        <div id="progress-bar-fill" class="progress-bar-fill"></div>
+                    </div>
+                </div>
+                
+                <!-- Statistics Card Grid -->
+                <h3 class="section-title">Performance Metrics</h3>
+                
+                <div class="stats-grid">
+                    <div class="stat-card stat-success">
+                        <label>Full Docking</label>
+                        <div id="stat-success" class="stat-val">0.0%</div>
+                    </div>
+                    <div class="stat-card stat-partial">
+                        <label>Partial Docking</label>
+                        <div id="stat-partial" class="stat-val">0.0%</div>
+                    </div>
+                    <div class="stat-card stat-danger">
+                        <label>Touched But Failed</label>
+                        <div id="stat-touched" class="stat-val">0.0%</div>
+                    </div>
+                    <div class="stat-card stat-danger">
+                        <label>Moving Term Fail</label>
+                        <div id="stat-moving" class="stat-val">0.0%</div>
+                    </div>
+                    <div class="stat-card stat-primary">
+                        <label>Average Score</label>
+                        <div id="stat-score" class="stat-val">0.00</div>
+                    </div>
+                    <div class="stat-card stat-primary">
+                        <label>Average Time</label>
+                        <div id="stat-time" class="stat-val">0.0<span class="stat-unit">s</span></div>
+                    </div>
+                </div>
+                
+                <!-- Live Event Console Log -->
+                <h3 class="section-title">Event Log</h3>
+                <div id="log-box" class="log-box">
+                    <div class="log-entry log-info">[Console] Welcome to the Docking Simulator. Select configurations and play.</div>
+                </div>
+            </div>
+        </section>
+        
+    </main>
+
+    <!-- Scripts -->
+    <script src="simulator.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

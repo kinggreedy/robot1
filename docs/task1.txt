@@ -1,0 +1,14 @@
+Docking
+You need to:
+1. Design a docking station that should include a “target mat”.
+2. The target should have dimensions no larger than 9 cm × 9 cm, and no smaller than 1 cm × 1 cm.
+3. The robot should start a distance of at least 1 m away from the target, measured on the plane, at a random orientation.
+The robot should have some termination indicator that it triggers when it has docked (e.g., playing a sound, turning on an LED).
+You will be scored by:
+(i) starting from three distinct locations;
+(ii) a run commences until either the first point at which the termination indicator is displayed and the robot is remaining stationary, or 3 minutes have elapsed, whichever is longer;
+(iii) you get performance points as follows:
+1. 10 points if, at termination, the robot has successfully docked, i.e., if the target is 100% obscured by the gridbot’s base.
+2. 2½ points if, at termination, the robot has covered a non-zero area of the target, but less than 100%.
+3. 1 point if the robot does not cover the target at termination, but did cover some part of the target at some point during the execution.
+4. -5 point if the termination indicator was displayed during execution, while the robot was moving.

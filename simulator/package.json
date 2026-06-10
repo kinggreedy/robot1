@@ -1,0 +1,17 @@
+{
+  "name": "docking-simulator",
+  "version": "1.0.0",
+  "description": "Autonomous Docking Simulator for Gridbot Task 1",
+  "main": "index.html",
+  "scripts": {
+    "dev": "npx http-server -p 8080"
+  },
+  "keywords": [
+    "simulator",
+    "docking",
+    "gridbot",
+    "canvas"
+  ],
+  "author": "Antigravity",
+  "license": "ISC"
+}
