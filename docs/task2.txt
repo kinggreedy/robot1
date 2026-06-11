@@ -1,0 +1,19 @@
+Environment “mapping”
+We will form a barricaded square region ±120 cm × 120 cm. Your robot will be placed within this
+space and given 5 minutes to move about. The environment will contain exactly one obstacle,
+which will be either a circular disk or a triangle. The robot must be placed to start within a corner.
+At the end of the 5 minutes, your robot should report which of the two cases applies to that
+environment.
+To complete this:
+1. Your robot should operate autonomously.
+2. Your robot may modify the environment in any non-destructive fashion†; no person in
+your team is permitted to modify or affix items to the interior of the environment.
+3. The robot can report the final classification via LEDs, sounds, wifi, etc.
+Note: the shapes will be available for your examination during the development phase.
+† if you need clarification on what constitutes destruction, please ask the instructors.
+You will be scored by:
+(i) an evaluation of a randomly selected environment type;
+(ii) a run commences ends after five minutes;
+(iii) you get performance points as follows: 5 points awarded if, at termination, the robot has
+successfully identified the environment type. Additional bonus points may be awarded for
+elegant software or hardware designs.

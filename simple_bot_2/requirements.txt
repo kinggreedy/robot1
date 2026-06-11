@@ -1,3 +1,5 @@
 adafruit-circuitpython-motor
 adafruit-circuitpython-asyncio
 adafruit-circuitpython-ticks
+adafruit-circuitpython-hcsr04
+adafruit-circuitpython-apds9960

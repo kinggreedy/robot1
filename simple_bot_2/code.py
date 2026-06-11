@@ -47,6 +47,27 @@ led = digitalio.DigitalInOut(board.GP10)
 led.direction = digitalio.Direction.OUTPUT
 led.value = False
 
+# Setup Sonar (Trig=GP13, Echo=GP12)
+sonar = None
+try:
+    import adafruit_hcsr04
+    sonar = adafruit_hcsr04.HCSR04(trigger_pin=board.GP13, echo_pin=board.GP12)
+    print("Sonar sensor initialized successfully.")
+except Exception as e:
+    print(f"Error initializing Sonar sensor: {e}")
+
+# Setup Color Sensor APDS-9960 (I2C: SCL=GP1, SDA=GP0)
+apds = None
+try:
+    import busio
+    from adafruit_apds9960.apds9960 import APDS9960
+    i2c = busio.I2C(board.GP1, board.GP0)
+    apds = APDS9960(i2c)
+    apds.enable_color = True
+    print("APDS-9960 Color sensor initialized successfully.")
+except Exception as e:
+    print(f"Error initializing APDS-9960 Color sensor: {e}")
+
 # Calibration state
 min_left, max_left = 65535, 0
 min_right, max_right = 65535, 0
@@ -197,70 +218,42 @@ def update_motor_behaviors(left_val, right_val):
 
     return rpm1, rpm2
 
-#Loop for reading sensor values and updating motor speed
+#Loop for reading sensor values and logging/printing
 async def read_sensors():
-    global light_source_present, guided_mode, INDICATE_END, stop_time
     while True:
-        if not calibrated:
-            await asyncio.sleep(0.1)
-            continue
-
         # Read raw light values (0-65535)
         left_val = light_sensor_left.value
         right_val = light_sensor_right.value
 
-        # Detect if the super bright flashlight is active
-        flashlight_detected = (left_val > max_left + FLASHLIGHT_MARGIN) or (right_val > max_right + FLASHLIGHT_MARGIN)
+        # Read sonar distance
+        sonar_dist = "N/A"
+        if sonar is not None:
+            try:
+                sonar_dist = f"{sonar.distance:.1f} cm"
+            except Exception as e:
+                sonar_dist = f"Error: {e}"
 
-        # Once flashlight is detected left or right, switch to guided mode
-        if flashlight_detected:
-            guided_mode = True
+        # Read color data
+        color_rgbc = "N/A"
+        if apds is not None:
+            try:
+                r, g, b, c = apds.color_data
+                color_rgbc = f"R={r}, G={g}, B={b}, C={c}"
+            except Exception as e:
+                color_rgbc = f"Error: {e}"
 
-        # Determine if we should move:
-        # - In guided mode: only move if the flashlight is currently detected (super bright light active)
-        # - Otherwise: move if there was a light source during calibration and we are above threshold
-        if guided_mode:
-            should_move = flashlight_detected
-        else:
-            should_move = light_source_present and ((left_val > threshold_left) or (right_val > threshold_right))
+        # Print all values to log/console
+        print(f"Time: {time.monotonic():.2f}s | Light: L={left_val}, R={right_val} | Sonar: {sonar_dist} | Color: {color_rgbc}")
 
-        if should_move:
-            rpm1, rpm2 = update_motor_behaviors(left_val, right_val)
-            # Reset stop timer and end indicator since we are moving
-            stop_time = None
-            INDICATE_END = False
-        else:
-            # Stop both motors if no light is detected above thresholds or initial condition had no source
-            if motor1.run_forever:
-                motor1.stop()
-            if motor2.run_forever:
-                motor2.stop()
-            rpm1 = 0.0
-            rpm2 = 0.0
-
-            # Start/check stop timer (tracks consecutive seconds of being stopped)
-            if stop_time is None:
-                stop_time = time.monotonic()
-            elif time.monotonic() - stop_time >= 10.0:
-                INDICATE_END = True
-
-        # Update the LED output based on the INDICATE_END state
-        led.value = INDICATE_END
-
-        print(f"Sensors: L={left_val} (RPM={rpm1:.2f}), R={right_val} (RPM={rpm2:.2f}) | Guided={guided_mode} | Active={should_move} | End={INDICATE_END}")
-
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)
 
 
 async def main():
-    asyncio.create_task(motor1.run())
-    asyncio.create_task(motor2.run())
-    # Start calibration
-    await calibrate_sensors()
-    # After calibration, start reading sensors
+    # Start reading sensors directly without calibration or motor movement
     asyncio.create_task(read_sensors())
-    # Wait on demo
-    await demo()
+    # Keep the program running
+    while True:
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
