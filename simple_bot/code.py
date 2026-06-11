@@ -6,14 +6,19 @@ import analogio
 
 from motor import StepperMotor
 
-# RPM Configuration (rescaling analog values 0-65535 to RPM range)
-MIN_RPM = 5.0   # User suggested 5 RPM is a good minimum speed
-MAX_RPM = 10.0  # Keep motor at 10 RPM max
+# RPM Configuration
+MIN_RPM = 5.0   # Minimum RPM when slowing down near light source
+MAX_RPM = 8.0   # Maximum RPM (user requested 8 max RPM)
 
 # Calibration parameters
-CALIBRATION_STEPS = 6144  # Number of steps for a 360-degree rotation (approx. 3 wheel revs)
-THRESHOLD_FRACTION = 0.2  # Threshold above/below ambient to trigger light following (20% of range)
+CALIBRATION_STEPS = 7022  # Number of steps to complete a full 360-degree rotation
+THRESHOLD_FRACTION = 0.6  # Threshold fraction above ambient
+UNIFORM_LIGHT_THRESHOLD = 3000  # Minimum difference to distinguish a light source from ambient
 LIGHT_POLARITY = 1        # 1 if more light increases sensor value (e.g. photodiode), -1 if it decreases
+FLASHLIGHT_MARGIN = 4000  # Margin above max ambient light to trigger flashlight mode
+
+# Motor direction for forward movement
+MOVE_DIRECTION = -1  # Set to -1 if robot moves backward during following, 1 if forward
 
 
 #Setup motors
@@ -37,54 +42,97 @@ motor2 = StepperMotor(
 light_sensor_left = analogio.AnalogIn(board.GP26)
 light_sensor_right = analogio.AnalogIn(board.GP27)
 
+# Setup LED (GP10 as digital output)
+led = digitalio.DigitalInOut(board.GP10)
+led.direction = digitalio.Direction.OUTPUT
+led.value = False
+
 # Calibration state
 min_left, max_left = 65535, 0
 min_right, max_right = 65535, 0
 threshold_left = 0.0
 threshold_right = 0.0
 calibrated = False
+light_source_present = False
+
+# Guided mode state (triggered when flashlight is detected)
+guided_mode = False
+
+# End indication state
+INDICATE_END = False
+stop_time = None
 
 async def calibrate_sensors():
     global min_left, max_left, min_right, max_right
-    global threshold_left, threshold_right, calibrated
-    
+    global threshold_left, threshold_right, calibrated, light_source_present
+
     print("Starting calibration... Spinning 360 degrees to scan ambient light.")
-    
+
     # Spin in place: Motor 1 forward, Motor 2 reverse
-    motor1.set_rpm(8.0)
-    motor2.set_rpm(8.0)
+    motor1.set_rpm(6.0)
+    motor2.set_rpm(6.0)
     motor1.move(CALIBRATION_STEPS)
     motor2.move(-CALIBRATION_STEPS)
-    
+
     min_l, max_l = 65535, 0
     min_r, max_r = 65535, 0
-    
+
+    readings_history = []
+    best_pos = 0
+    best_smoothed_val = 0
+    min_smoothed_val = 65535
+
     while motor1.busy or motor2.busy:
         left_val = light_sensor_left.value
         right_val = light_sensor_right.value
-        
+
+        # Track raw min/max for normalization
         if left_val < min_l: min_l = left_val
         if left_val > max_l: max_l = left_val
         if right_val < min_r: min_r = right_val
         if right_val > max_r: max_r = right_val
-        
-        print(f"Scanning... Left: {left_val}, Right: {right_val}")
+
+        # Calculate current average light and keep a history of size 5 for smoothing
+        avg_val = (left_val + right_val) / 2.0
+        readings_history.append(avg_val)
+        if len(readings_history) > 5:
+            readings_history.pop(0)
+
+        # Smooth reading to prevent peak light error
+        smoothed_val = sum(readings_history) / len(readings_history)
+
+        current_pos = motor1.position
+        if smoothed_val > best_smoothed_val:
+            best_smoothed_val = smoothed_val
+            best_pos = current_pos
+
+        if len(readings_history) == 5 and smoothed_val < min_smoothed_val:
+            min_smoothed_val = smoothed_val
+
+        print(f"Scanning... Pos: {current_pos}, L: {left_val}, R: {right_val}, Smoothed: {smoothed_val:.1f}")
         await asyncio.sleep(0.05)
-        
+
     min_left, max_left = min_l, max_l
     min_right, max_right = min_r, max_r
-    
-    # Calculate thresholds based on polarity
+
+    # Calculate thresholds
     range_l = max_left - min_left
     range_r = max_right - min_right
-    
-    if LIGHT_POLARITY == 1:
-        threshold_left = min_left + range_l * THRESHOLD_FRACTION
-        threshold_right = min_right + range_r * THRESHOLD_FRACTION
+    threshold_left = min_left + range_l * THRESHOLD_FRACTION
+    threshold_right = min_right + range_r * THRESHOLD_FRACTION
+
+    # Check if the environment has a distinct light source during scan
+    if (best_smoothed_val - min_smoothed_val) >= UNIFORM_LIGHT_THRESHOLD:
+        light_source_present = True
+        print(f"Brightest source detected! Rotating back to direction {best_pos}.")
+        # Rotate back to face the brightest source
+        motor1.move_to(best_pos)
+        motor2.move_to(-best_pos)
+        await wait_for_motors(motor1, motor2)
     else:
-        threshold_left = max_left - range_l * THRESHOLD_FRACTION
-        threshold_right = max_right - range_r * THRESHOLD_FRACTION
-        
+        light_source_present = False
+        print("Environment is uniform. Sticking to stationary mode until a bright light is detected.")
+
     calibrated = True
     print("Calibration finished!")
     print(f"Left sensor: min={min_left}, max={max_left}, threshold={threshold_left:.1f}")
@@ -101,77 +149,106 @@ async def demo():
     # Wait until calibration is complete
     while not calibrated:
         await asyncio.sleep(0.1)
-    
+
     # The read_sensors loop handles motor movement based on sensor inputs
     while True:
         await asyncio.sleep(1)
 
 def update_motor_behaviors(left_val, right_val):
-    # Determine if light is detected above/below threshold
-    light_detected_l = False
-    light_detected_r = False
-    rpm1 = 0.0
-    rpm2 = 0.0
-    
-    if LIGHT_POLARITY == 1:
-        if left_val > threshold_left:
-            light_detected_l = True
-            denom = max(1, max_left - threshold_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((left_val - threshold_left) / denom)
-            
-        if right_val > threshold_right:
-            light_detected_r = True
-            denom = max(1, max_right - threshold_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((right_val - threshold_right) / denom)
+    # Normalize values relative to calibrated ambient range to handle mounting differences
+    range_l = max(1, max_left - min_left)
+    range_r = max(1, max_right - min_right)
+    norm_l = (left_val - min_left) / range_l
+    norm_r = (right_val - min_right) / range_r
+
+    # Base speeds
+    rpm1 = MAX_RPM
+    rpm2 = MAX_RPM
+
+    # Steer towards the side with the higher normalized reading
+    # Slow down the motor on the brighter side (inverse steering)
+    diff = norm_l - norm_r
+    if diff > 0:
+        # Turn left: slow down left motor
+        rpm1 = MAX_RPM - diff * 6.0  # Steer gain
     else:
-        if left_val < threshold_left:
-            light_detected_l = True
-            denom = max(1, threshold_left - min_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_left - left_val) / denom)
-            
-        if right_val < threshold_right:
-            light_detected_r = True
-            denom = max(1, threshold_right - min_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_right - right_val) / denom)
-            
-    # Apply motor controls based on light detection
-    if light_detected_l:
-        rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
-        motor1.set_rpm(rpm1)
-        if not motor1.run_forever:
-            motor1.move_forever(1)
-    else:
-        if motor1.run_forever:
-            motor1.stop()
-        rpm1 = 0.0
-        
-    if light_detected_r:
-        rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
-        motor2.set_rpm(rpm2)
-        if not motor2.run_forever:
-            motor2.move_forever(1)
-    else:
-        if motor2.run_forever:
-            motor2.stop()
-        rpm2 = 0.0
+        # Turn right: slow down right motor
+        rpm2 = MAX_RPM - abs(diff) * 6.0
+
+    # Slow down if both sensors are close to a bright source (large norm values)
+    avg_norm = (norm_l + norm_r) / 2.0
+    if avg_norm > 1.2:
+        scale = max(0.2, 1.0 - (avg_norm - 1.2) * 0.5)
+        rpm1 *= scale
+        rpm2 *= scale
+
+    # Apply safety bounds
+    rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
+    rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
+
+    # Set motor speeds and start them if not running
+    motor1.set_rpm(rpm1)
+    if not motor1.run_forever:
+        motor1.move_forever(MOVE_DIRECTION)
+
+    motor2.set_rpm(rpm2)
+    if not motor2.run_forever:
+        motor2.move_forever(MOVE_DIRECTION)
 
     return rpm1, rpm2
 
 #Loop for reading sensor values and updating motor speed
 async def read_sensors():
+    global light_source_present, guided_mode, INDICATE_END, stop_time
     while True:
         if not calibrated:
             await asyncio.sleep(0.1)
             continue
-            
+
         # Read raw light values (0-65535)
         left_val = light_sensor_left.value
         right_val = light_sensor_right.value
-        
-        rpm1, rpm2 = update_motor_behaviors(left_val, right_val)
-        
-        print(f"Sensors: L={left_val} (RPM={rpm1:.2f}), R={right_val} (RPM={rpm2:.2f})")
-            
+
+        # Detect if the super bright flashlight is active
+        flashlight_detected = (left_val > max_left + FLASHLIGHT_MARGIN) or (right_val > max_right + FLASHLIGHT_MARGIN)
+
+        # Once flashlight is detected left or right, switch to guided mode
+        if flashlight_detected:
+            guided_mode = True
+
+        # Determine if we should move:
+        # - In guided mode: only move if the flashlight is currently detected (super bright light active)
+        # - Otherwise: move if there was a light source during calibration and we are above threshold
+        if guided_mode:
+            should_move = flashlight_detected
+        else:
+            should_move = light_source_present and ((left_val > threshold_left) or (right_val > threshold_right))
+
+        if should_move:
+            rpm1, rpm2 = update_motor_behaviors(left_val, right_val)
+            # Reset stop timer and end indicator since we are moving
+            stop_time = None
+            INDICATE_END = False
+        else:
+            # Stop both motors if no light is detected above thresholds or initial condition had no source
+            if motor1.run_forever:
+                motor1.stop()
+            if motor2.run_forever:
+                motor2.stop()
+            rpm1 = 0.0
+            rpm2 = 0.0
+
+            # Start/check stop timer (tracks consecutive seconds of being stopped)
+            if stop_time is None:
+                stop_time = time.monotonic()
+            elif time.monotonic() - stop_time >= 10.0:
+                INDICATE_END = True
+
+        # Update the LED output based on the INDICATE_END state
+        led.value = INDICATE_END
+
+        print(f"Sensors: L={left_val} (RPM={rpm1:.2f}), R={right_val} (RPM={rpm2:.2f}) | Guided={guided_mode} | Active={should_move} | End={INDICATE_END}")
+
         await asyncio.sleep(0.05)
 
 
