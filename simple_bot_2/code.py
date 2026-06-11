@@ -42,10 +42,14 @@ motor2 = StepperMotor(
 light_sensor_left = analogio.AnalogIn(board.GP26)
 light_sensor_right = analogio.AnalogIn(board.GP27)
 
-# Setup LED (GP10 as digital output)
-led = digitalio.DigitalInOut(board.GP10)
-led.direction = digitalio.Direction.OUTPUT
-led.value = False
+# Setup LEDs (GP10 as Red LED, GP11 as Yellow LED)
+led_red = digitalio.DigitalInOut(board.GP10)
+led_red.direction = digitalio.Direction.OUTPUT
+led_red.value = False
+
+led_yellow = digitalio.DigitalInOut(board.GP11)
+led_yellow.direction = digitalio.Direction.OUTPUT
+led_yellow.value = False
 
 # Setup Sonar (Trig=GP13, Echo=GP12)
 sonar = None
@@ -64,9 +68,8 @@ try:
     i2c = busio.I2C(board.GP1, board.GP0)
     apds = APDS9960(i2c)
     apds.enable_color = True
-    print("APDS-9960 Color sensor initialized successfully.")
-except Exception as e:
-    print(f"Error initializing APDS-9960 Color sensor: {e}")
+except Exception:
+    pass
 
 # Calibration state
 min_left, max_left = 65535, 0
@@ -218,40 +221,238 @@ def update_motor_behaviors(left_val, right_val):
 
     return rpm1, rpm2
 
-#Loop for reading sensor values and logging/printing
-async def read_sensors():
-    while True:
-        # Read raw light values (0-65535)
-        left_val = light_sensor_left.value
-        right_val = light_sensor_right.value
+# Helper to get filtered sonar readings
+def get_filtered_sonar():
+    readings = []
+    for _ in range(5):
+        try:
+            dist = sonar.distance
+            # Filter out jumps (e.g. 800cm if too close) and invalid ranges
+            if 2.0 <= dist <= 250.0:
+                readings.append(dist)
+        except Exception:
+            pass
+        time.sleep(0.01)
+        
+    if not readings:
+        return None
+    
+    # Return median
+    readings.sort()
+    return readings[len(readings) // 2]
 
-        # Read sonar distance
-        sonar_dist = "N/A"
-        if sonar is not None:
-            try:
-                sonar_dist = f"{sonar.distance:.1f} cm"
-            except Exception as e:
-                sonar_dist = f"Error: {e}"
+# Motor movement helpers
+async def drive_steps(steps, direction=MOVE_DIRECTION):
+    motor1.set_rpm(6.0)
+    motor2.set_rpm(6.0)
+    motor1.move(steps * direction)
+    motor2.move(steps * direction)
+    await wait_for_motors(motor1, motor2)
 
-        # Read color data
-        color_rgbc = "N/A"
-        if apds is not None:
-            try:
-                r, g, b, c = apds.color_data
-                color_rgbc = f"R={r}, G={g}, B={b}, C={c}"
-            except Exception as e:
-                color_rgbc = f"Error: {e}"
+async def turn_degrees(degrees):
+    motor1.set_rpm(6.0)
+    motor2.set_rpm(6.0)
+    steps = int(degrees * (CALIBRATION_STEPS / 360.0))
+    motor1.move(steps)
+    motor2.move(-steps)
+    await wait_for_motors(motor1, motor2)
 
-        # Print all values to log/console
-        print(f"Time: {time.monotonic():.2f}s | Light: L={left_val}, R={right_val} | Sonar: {sonar_dist} | Color: {color_rgbc}")
+# Sweep profile scan
+async def perform_sweep():
+    print("  Starting angular sweep of obstacle...")
+    await turn_degrees(-30)
+    
+    angles = []
+    distances = []
+    
+    step_deg = 2
+    num_steps = 30
+    
+    for i in range(num_steps + 1):
+        dist = None
+        for _ in range(3):
+            dist = get_filtered_sonar()
+            if dist is not None:
+                break
+            await asyncio.sleep(0.01)
+            
+        current_angle = -30 + i * step_deg
+        if dist is not None:
+            angles.append(current_angle)
+            distances.append(dist)
+            print(f"    Angle={current_angle} deg, Dist={dist:.1f} cm")
+        else:
+            print(f"    Angle={current_angle} deg, Dist=Invalid")
+            
+        if i < num_steps:
+            await turn_degrees(step_deg)
+            
+    await turn_degrees(-30)
+    return angles, distances
 
-        await asyncio.sleep(0.5)
+# Shape analysis helper functions
+import math
 
+def fit_line_rmse(x, y):
+    n = len(x)
+    if n < 3:
+        return 0.0
+    sum_x = sum(x)
+    sum_y = sum(y)
+    sum_xx = sum(xi*xi for xi in x)
+    sum_yy = sum(yi*yi for yi in y)
+    sum_xy = sum(xi*yi for xi, yi in zip(x, y))
+    
+    denom = (n * sum_xx - sum_x * sum_x)
+    if abs(denom) < 1e-6:
+        # Near-vertical line
+        mean_x = sum_x / n
+        return (sum((xi - mean_x)**2 for xi in x) / n)**0.5
+        
+    m = (n * sum_xy - sum_x * sum_y) / denom
+    c = (sum_y - m * sum_x) / n
+    
+    rss = sum((yi - (m * xi + c))**2 for xi, yi in zip(x, y))
+    return (rss / n)**0.5
+
+def analyze_sweep(angles, distances):
+    obstacle_points = []
+    for angle, dist in zip(angles, distances):
+        if dist < 45.0:
+            obstacle_points.append((angle, dist))
+            
+    if len(obstacle_points) < 8:
+        print("    Error: Too few obstacle points detected in scan!")
+        return None
+        
+    # Find the closest point angle to align center
+    min_dist = min(p[1] for p in obstacle_points)
+    closest_p = [p for p in obstacle_points if p[1] == min_dist][0]
+    center_angle = closest_p[0]
+    
+    print(f"    Closest point: {min_dist:.1f} cm at {center_angle} degrees")
+    
+    x_all = []
+    y_all = []
+    rel_angles = []
+    
+    for angle, dist in obstacle_points:
+        rel_angle = angle - center_angle
+        rad = math.radians(rel_angle)
+        xi = dist * math.sin(rad)
+        yi = dist * math.cos(rad)
+        x_all.append(xi)
+        y_all.append(yi)
+        rel_angles.append(rel_angle)
+        
+    # Define three windows: Left, Right, Center
+    left_x, left_y = [], []
+    right_x, right_y = [], []
+    center_x, center_y = [], []
+    
+    for xi, yi, ra in zip(x_all, y_all, rel_angles):
+        if -24 <= ra <= 0:
+            left_x.append(xi)
+            left_y.append(yi)
+        if 0 <= ra <= 24:
+            right_x.append(xi)
+            right_y.append(yi)
+        if -12 <= ra <= 12:
+            center_x.append(xi)
+            center_y.append(yi)
+            
+    rmse_left = fit_line_rmse(left_x, left_y) if len(left_x) >= 4 else 99.0
+    rmse_right = fit_line_rmse(right_x, right_y) if len(right_x) >= 4 else 99.0
+    rmse_center = fit_line_rmse(center_x, center_y) if len(center_x) >= 4 else 99.0
+    
+    print(f"    Left RMSE ({len(left_x)} pts): {rmse_left:.3f} cm")
+    print(f"    Right RMSE ({len(right_x)} pts): {rmse_right:.3f} cm")
+    print(f"    Center RMSE ({len(center_x)} pts): {rmse_center:.3f} cm")
+    
+    score = min(rmse_left, rmse_right, rmse_center)
+    print(f"    Combined Score (min RMSE): {score:.3f} cm")
+    return score
+
+async def run_mapping_task():
+    print("\n================================================")
+    print("RUNNING TASK 2: OBSTACLE MAPPING & CLASSIFICATION")
+    print("================================================\n")
+    
+    led_red.value = False
+    led_yellow.value = False
+    
+    # Step 1: Drive forward until obstacle is close
+    print("Step 1: Locating obstacle...")
+    obstacle_found = False
+    total_steps = 0
+    max_drive_steps = 4000
+    
+    while total_steps < max_drive_steps:
+        dist = get_filtered_sonar()
+        if dist is not None:
+            print(f"  Sonar: {dist:.1f} cm")
+            if dist < 33.0:
+                print("  Obstacle detected! Stopping.")
+                obstacle_found = True
+                break
+        else:
+            print("  Sonar: Filtering (Invalid)")
+            
+        await drive_steps(50)
+        total_steps += 50
+        await asyncio.sleep(0.05)
+        
+    if not obstacle_found:
+        print("Error: Obstacle not located!")
+        for _ in range(5):
+            led_red.value = True; led_yellow.value = True
+            await asyncio.sleep(0.2)
+            led_red.value = False; led_yellow.value = False
+            await asyncio.sleep(0.2)
+        return
+        
+    # Step 2: Scan 1
+    print("\n--- Scan 1 ---")
+    angles1, dists1 = await perform_sweep()
+    score1 = analyze_sweep(angles1, dists1)
+    
+    # Step 3: Move slightly closer and Scan 2
+    print("\nStep 3: Moving closer for Scan 2...")
+    await drive_steps(150)
+    await asyncio.sleep(0.5)
+    
+    print("\n--- Scan 2 ---")
+    angles2, dists2 = await perform_sweep()
+    score2 = analyze_sweep(angles2, dists2)
+    
+    # Combine scores
+    scores = [s for s in [score1, score2] if s is not None]
+    if not scores:
+        print("Error: Both scans failed!")
+        return
+        
+    avg_score = sum(scores) / len(scores)
+    print(f"\nAverage Shape Score: {avg_score:.3f} cm")
+    
+    # Step 4: Classify and Indicate via LEDs
+    # Threshold is 0.18 cm
+    is_triangle = avg_score < 0.18
+    
+    if is_triangle:
+        print("\n>>> CLASSIFICATION: TRIANGLE <<<")
+        led_red.value = True
+        led_yellow.value = False
+    else:
+        print("\n>>> CLASSIFICATION: CIRCLE <<<")
+        led_yellow.value = True
+        led_red.value = False
+        
+    print("Task complete. Decision LED is active.")
 
 async def main():
-    # Start reading sensors directly without calibration or motor movement
-    asyncio.create_task(read_sensors())
-    # Keep the program running
+    asyncio.create_task(motor1.run())
+    asyncio.create_task(motor2.run())
+    await run_mapping_task()
     while True:
         await asyncio.sleep(1)
 

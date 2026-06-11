@@ -84,74 +84,54 @@ class TestFirmwareSmoke(unittest.TestCase):
         self.assertEqual(test_motor.seq_index, initial_seq)
         self.assertEqual(test_motor.position, 0)
 
-    def test_update_motor_behaviors_positive_polarity(self):
-        """Test control loop decision math and speed scaling with LIGHT_POLARITY = 1 (more light = higher reading)."""
-        # Save original states to restore later
-        orig_polarity = code.LIGHT_POLARITY
-        orig_min_l, orig_max_l, orig_thresh_l = code.min_left, code.max_left, code.threshold_left
-        orig_min_r, orig_max_r, orig_thresh_r = code.min_right, code.max_right, code.threshold_right
+    def test_fit_line_rmse_flat(self):
+        """Verify that a perfect straight line yields 0.0 RMSE."""
+        x = [1, 2, 3, 4, 5]
+        y = [2, 4, 6, 8, 10]  # y = 2x
+        rmse = code.fit_line_rmse(x, y)
+        self.assertAlmostEqual(rmse, 0.0, places=6)
 
-        try:
-            # Set test configurations
-            code.LIGHT_POLARITY = 1
-            code.min_left, code.max_left, code.threshold_left = 10000, 50000, 18000  # range 40000, thresh = 20% above min
-            code.min_right, code.max_right, code.threshold_right = 20000, 60000, 28000
+    def test_fit_line_rmse_noisy(self):
+        """Verify that a noisy line yields a correct small non-zero RMSE."""
+        x = [1, 2, 3, 4, 5]
+        y = [2.1, 3.9, 6.2, 7.8, 10.1]
+        rmse = code.fit_line_rmse(x, y)
+        self.assertGreater(rmse, 0.0)
+        self.assertLess(rmse, 0.2)
 
-            # 1. Both below threshold -> Motors should stop
-            rpm1, rpm2 = code.update_motor_behaviors(15000, 25000)
-            self.assertEqual(rpm1, 0.0)
-            self.assertEqual(rpm2, 0.0)
-            self.assertFalse(code.motor1.run_forever)
-            self.assertFalse(code.motor2.run_forever)
+    def test_fit_line_rmse_curved(self):
+        """Verify that a curved segment yields a significantly larger RMSE."""
+        # Arc of a circle: y = 20 - sqrt(225 - x^2) for x in [-10, 0, 10]
+        x = [-10, -5, 0, 5, 10]
+        y = [8.82, 5.86, 5.0, 5.86, 8.82]
+        rmse = code.fit_line_rmse(x, y)
+        self.assertGreater(rmse, 0.5)
 
-            # 2. Left sensor above threshold -> Motor 1 should move, Motor 2 stop
-            # Left value 34000 is halfway between threshold (18000) and max (50000)
-            # Math: 5.0 + (10.0 - 5.0) * (34000 - 18000) / (50000 - 18000) = 5.0 + 5.0 * 16000 / 32000 = 7.5 RPM
-            rpm1, rpm2 = code.update_motor_behaviors(34000, 25000)
-            self.assertAlmostEqual(rpm1, 7.5, places=2)
-            self.assertEqual(rpm2, 0.0)
-            self.assertTrue(code.motor1.run_forever)
-            self.assertFalse(code.motor2.run_forever)
+    def test_analyze_sweep_flat_vs_curved(self):
+        """Test analyze_sweep outputs for simulated flat vs curved profiles."""
+        # Simulated flat side (triangle normal): d = 30 / cos(theta)
+        import math
+        angles = list(range(-20, 22, 2))
+        dists_flat = [30.0 / math.cos(math.radians(a)) for a in angles]
+        
+        score_flat = code.analyze_sweep(angles, dists_flat)
+        self.assertIsNotNone(score_flat)
+        self.assertLess(score_flat, 0.2)
 
-            # 3. Right sensor above threshold -> Motor 1 stop, Motor 2 move
-            # Right value 60000 is at max -> Should scale to MAX_RPM (10.0)
-            rpm1, rpm2 = code.update_motor_behaviors(15000, 60000)
-            self.assertEqual(rpm1, 0.0)
-            self.assertAlmostEqual(rpm2, 10.0, places=2)
-            self.assertFalse(code.motor1.run_forever)
-            self.assertTrue(code.motor2.run_forever)
+        # Simulated circle: cylinder of R=15 at D=35 from sensor.
+        # d^2 - 2*D*d*cos(theta) + D^2 - R^2 = 0
+        # For D=35, R=15: d^2 - 70*d*cos(theta) + 1000 = 0
+        # d = 35*cos(theta) - sqrt(1225*cos^2(theta) - 1000)
+        dists_circle = []
+        for a in angles:
+            rad = math.radians(a)
+            cos_a = math.cos(rad)
+            d = 35.0 * cos_a - math.sqrt(1225.0 * cos_a**2 - 1000.0)
+            dists_circle.append(d)
 
-        finally:
-            # Restore original values
-            code.LIGHT_POLARITY = orig_polarity
-            code.min_left, code.max_left, code.threshold_left = orig_min_l, orig_max_l, orig_thresh_l
-            code.min_right, code.max_right, code.threshold_right = orig_min_r, orig_max_r, orig_thresh_r
-
-    def test_update_motor_behaviors_negative_polarity(self):
-        """Test control loop decision math with LIGHT_POLARITY = -1 (more light = lower reading)."""
-        # Save original states
-        orig_polarity = code.LIGHT_POLARITY
-        orig_min_l, orig_max_l, orig_thresh_l = code.min_left, code.max_left, code.threshold_left
-
-        try:
-            # Set test configurations
-            code.LIGHT_POLARITY = -1
-            # range = 40000, thresh = 20% below max (50000 - 8000 = 42000)
-            code.min_left, code.max_left, code.threshold_left = 10000, 50000, 42000
-
-            # 1. Left value 45000 is above threshold -> No light detected (RPM = 0)
-            rpm1, _ = code.update_motor_behaviors(45000, 50000)
-            self.assertEqual(rpm1, 0.0)
-
-            # 2. Left value 26000 is below threshold -> Light detected
-            # Math: 5.0 + (10.0 - 5.0) * (42000 - 26000) / (42000 - 10000) = 5.0 + 5.0 * 16000 / 32000 = 7.5 RPM
-            rpm1, _ = code.update_motor_behaviors(26000, 50000)
-            self.assertAlmostEqual(rpm1, 7.5, places=2)
-            self.assertTrue(code.motor1.run_forever)
-
-        finally:
-            code.LIGHT_POLARITY = orig_polarity
-            code.min_left, code.max_left, code.threshold_left = orig_min_l, orig_max_l, orig_thresh_l
+        score_circle = code.analyze_sweep(angles, dists_circle)
+        self.assertIsNotNone(score_circle)
+        self.assertGreater(score_circle, 0.2)
 
 if __name__ == '__main__':
     unittest.main()

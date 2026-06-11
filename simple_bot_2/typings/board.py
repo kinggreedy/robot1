@@ -3,6 +3,12 @@ class _Pin:
         self.name = name
 
 
+GP0 = _Pin("GP0")
+GP1 = _Pin("GP1")
+GP10 = _Pin("GP10")
+GP11 = _Pin("GP11")
+GP12 = _Pin("GP12")
+GP13 = _Pin("GP13")
 GP15 = _Pin("GP15")
 GP16 = _Pin("GP16")
 GP17 = _Pin("GP17")
