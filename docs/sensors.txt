@@ -1,8 +1,8 @@
 photodiode
-color sensor (+ gesture)
+color sensor (+ gesture) -- APDS-9960
 IMU
 camera
-ultrasonic range  (probably 10 cm?)
+ultrasonic range  (probably 10 cm?) - HC-SR04 Ultrasonic Sensor
 colored tape
 magnets + sensor (Hall)
 speaker + microphones
@@ -12,5 +12,11 @@ speaker + microphones
 UF2 Bootloader v1.0
 Model: Raspberry Pi RP2350
 Board-ID: RP2350
+Adafruit CircuitPython 10.2.1 on 2026-05-13; Raspberry Pi Pico 2 W with rp2350a
+Board ID:raspberry_pi_pico2_w
+
+----
 
 STEP MOTOR ROHS 28BYJ-48
+LED Yellow
+LED Red
