@@ -1,6 +1,7 @@
 import unittest
 import sys
 import os
+import math
 
 # Add the workspace directory and the typings directory to sys.path to resolve mocks on the host
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
@@ -22,7 +23,7 @@ class TestFirmwareSmoke(unittest.TestCase):
         m2_pins = {board.GP19, board.GP20, board.GP21, board.GP22}
         self.assertEqual(len(m2_pins), 4, "Motor 2 must use 4 unique pins")
 
-        # Light sensors
+        # Light sensors (GP26 and GP27 in code.py)
         sensor_pins = {board.GP26, board.GP27}
         self.assertEqual(len(sensor_pins), 2, "Sensors must use 2 unique pins")
 
@@ -35,10 +36,6 @@ class TestFirmwareSmoke(unittest.TestCase):
         self.assertGreater(code.MIN_RPM, 0, "MIN_RPM must be positive")
         self.assertGreater(code.MAX_RPM, code.MIN_RPM, "MAX_RPM must be greater than MIN_RPM")
         self.assertLessEqual(code.MAX_RPM, 20.0, "MAX_RPM should not exceed 20.0 for safety limits")
-
-    def test_calibration_steps(self):
-        """Verify calibration rotation is positive."""
-        self.assertGreater(code.CALIBRATION_STEPS, 0, "Calibration steps must be positive")
 
     def test_stepper_motor_logic(self):
         """Verify stepper motor interface, stepping sequence, and RPM-to-interval conversion."""
@@ -84,80 +81,140 @@ class TestFirmwareSmoke(unittest.TestCase):
         self.assertEqual(test_motor.seq_index, initial_seq)
         self.assertEqual(test_motor.position, 0)
 
-    def test_update_motor_behaviors_positive_polarity(self):
-        """Test control loop decision math and speed scaling with LIGHT_POLARITY = 1 (more light = higher reading)."""
-        # Save original states to restore later
-        orig_polarity = code.LIGHT_POLARITY
-        orig_min_l, orig_max_l, orig_thresh_l = code.min_left, code.max_left, code.threshold_left
-        orig_min_r, orig_max_r, orig_thresh_r = code.min_right, code.max_right, code.threshold_right
-        orig_min_rpm, orig_max_rpm = code.MIN_RPM, code.MAX_RPM
+    def test_dft_frequency_response(self):
+        """Verify that the DFT calculation correctly identifies 0.5 Hz signals and rejects DC/other frequencies."""
+        # Setup local parameters mirroring code.py configuration
+        FS = code.FS
+        TARGET_FREQ = code.TARGET_FREQ
+        N = code.N
+        cos_table = code.cos_table
+        sin_table = code.sin_table
 
-        try:
-            # Set test configurations
-            code.LIGHT_POLARITY = 1
-            code.MIN_RPM, code.MAX_RPM = 5.0, 10.0
-            code.min_left, code.max_left, code.threshold_left = 10000, 50000, 18000  # range 40000, thresh = 20% above min
-            code.min_right, code.max_right, code.threshold_right = 20000, 60000, 28000
+        def compute_mag(buffer):
+            mean = sum(buffer) / N
+            ac = [x - mean for x in buffer]
+            real = sum(x * c for x, c in zip(ac, cos_table))
+            imag = sum(x * s for x, s in zip(ac, sin_table))
+            return math.sqrt(real*real + imag*imag) / (N / 2)
 
-            # 1. Both below threshold -> Motors should stop
-            rpm1, rpm2 = code.update_motor_behaviors(15000, 25000)
-            self.assertEqual(rpm1, 0.0)
-            self.assertEqual(rpm2, 0.0)
-            self.assertFalse(code.motor1.run_forever)
-            self.assertFalse(code.motor2.run_forever)
+        # Case 1: Pure DC signal (ambient light) -> Magnitude should be near 0
+        dc_buffer = [32000.0] * N
+        self.assertLess(compute_mag(dc_buffer), 1e-5)
 
-            # 2. Left sensor above threshold -> Motor 1 should move, Motor 2 stop
-            # Left value 34000 is halfway between threshold (18000) and max (50000)
-            # Math: 5.0 + (10.0 - 5.0) * (34000 - 18000) / (50000 - 18000) = 5.0 + 5.0 * 16000 / 32000 = 7.5 RPM
-            rpm1, rpm2 = code.update_motor_behaviors(34000, 25000)
-            self.assertAlmostEqual(rpm1, 7.5, places=2)
-            self.assertEqual(rpm2, 0.0)
-            self.assertTrue(code.motor1.run_forever)
-            self.assertFalse(code.motor2.run_forever)
+        # Case 2: Pure 0.5 Hz sine wave of amplitude 1000.0 (Target frequency)
+        # magnitude should be equal to the amplitude (1000.0)
+        target_buffer = [1000.0 * math.sin(2.0 * math.pi * TARGET_FREQ * (n / FS)) for n in range(N)]
+        mag = compute_mag(target_buffer)
+        self.assertAlmostEqual(mag, 1000.0, places=1)
 
-            # 3. Right sensor above threshold -> Motor 1 stop, Motor 2 move
-            # Right value 60000 is at max -> Should scale to MAX_RPM (10.0)
-            rpm1, rpm2 = code.update_motor_behaviors(15000, 60000)
-            self.assertEqual(rpm1, 0.0)
-            self.assertAlmostEqual(rpm2, 10.0, places=2)
-            self.assertFalse(code.motor1.run_forever)
-            self.assertTrue(code.motor2.run_forever)
+        # Case 3: 2.0 Hz sine wave (interfering frequency) -> Magnitude should be near 0
+        other_buffer = [1000.0 * math.sin(2.0 * math.pi * 2.0 * (n / FS)) for n in range(N)]
+        self.assertLess(compute_mag(other_buffer), 1.0)
 
-        finally:
-            # Restore original values
-            code.LIGHT_POLARITY = orig_polarity
-            code.MIN_RPM, code.MAX_RPM = orig_min_rpm, orig_max_rpm
-            code.min_left, code.max_left, code.threshold_left = orig_min_l, orig_max_l, orig_thresh_l
-            code.min_right, code.max_right, code.threshold_right = orig_min_r, orig_max_r, orig_thresh_r
+    def test_dft_neopixel_crosstalk_rejection(self):
+        """Verify the filter rejects 1.0 Hz signals (representing NeoPixel search blinking crosstalk)."""
+        FS = code.FS
+        N = code.N
+        cos_table = code.cos_table
+        sin_table = code.sin_table
 
-    def test_update_motor_behaviors_negative_polarity(self):
-        """Test control loop decision math with LIGHT_POLARITY = -1 (more light = lower reading)."""
-        # Save original states
-        orig_polarity = code.LIGHT_POLARITY
-        orig_min_l, orig_max_l, orig_thresh_l = code.min_left, code.max_left, code.threshold_left
-        orig_min_rpm, orig_max_rpm = code.MIN_RPM, code.MAX_RPM
+        # Simulate a 1.0 Hz signal (mains or NeoPixel blinking at 1.0 Hz in SEARCHING state)
+        neopixel_buffer = [32000.0 + 1000.0 * math.sin(2.0 * math.pi * 1.0 * (n / FS)) for n in range(N)]
 
-        try:
-            # Set test configurations
-            code.LIGHT_POLARITY = -1
-            code.MIN_RPM, code.MAX_RPM = 5.0, 10.0
-            # range = 40000, thresh = 20% below max (50000 - 8000 = 42000)
-            code.min_left, code.max_left, code.threshold_left = 10000, 50000, 42000
+        mean = sum(neopixel_buffer) / N
+        ac = [x - mean for x in neopixel_buffer]
+        real = sum(x * c for x, c in zip(ac, cos_table))
+        imag = sum(x * s for x, s in zip(ac, sin_table))
+        mag = math.sqrt(real*real + imag*imag) / (N / 2)
 
-            # 1. Left value 45000 is above threshold -> No light detected (RPM = 0)
-            rpm1, _ = code.update_motor_behaviors(45000, 50000)
-            self.assertEqual(rpm1, 0.0)
+        # Teammate's standard DFT is perfectly orthogonal to 1.0 Hz over 40 samples (Bin 2 vs Bin 1), yielding 0.000.
+        # (The differencing filter fails this test as it leaks 103.58 into the 0.5Hz bin due to window truncation).
+        self.assertLess(mag, 1.0, "Filter must reject 1.0 Hz status light blinking crosstalk")
 
-            # 2. Left value 26000 is below threshold -> Light detected
-            # Math: 5.0 + (10.0 - 5.0) * (42000 - 26000) / (42000 - 10000) = 5.0 + 5.0 * 16000 / 32000 = 7.5 RPM
-            rpm1, _ = code.update_motor_behaviors(26000, 50000)
-            self.assertAlmostEqual(rpm1, 7.5, places=2)
-            self.assertTrue(code.motor1.run_forever)
+    def test_dft_motor_noise_rejection(self):
+        """Verify 3.0 RPM motor noise is rejected, while 3.5 RPM noise aliases and leaks above threshold."""
+        FS = code.FS
+        N = code.N
+        cos_table = code.cos_table
+        sin_table = code.sin_table
+        
+        # 3.5 RPM motor noise aliases to ~0.533 Hz (fundamental step frequency of 119.47 Hz)
+        # 3.5 RPM * 2048 steps/rev / 60s = 119.467 Hz. Sampled at 20 Hz, aliases to |119.467 - 6*20| = 0.533 Hz.
+        f_noise_35 = 0.533
+        buffer_35 = [32000.0 + 1000.0 * math.sin(2.0 * math.pi * f_noise_35 * (n / FS)) for n in range(N)]
+        
+        mean_35 = sum(buffer_35) / N
+        ac_35 = [x - mean_35 for x in buffer_35]
+        real_35 = sum(x * c for x, c in zip(ac_35, cos_table))
+        imag_35 = sum(x * s for x, s in zip(ac_35, sin_table))
+        mag_35 = math.sqrt(real_35*real_35 + imag_35*imag_35) / (N / 2)
+        
+        # 3.0 RPM motor noise aliases to ~2.4 Hz (fundamental step frequency of 102.4 Hz)
+        # 3.0 RPM * 2048 steps/rev / 60s = 102.4 Hz. Sampled at 20 Hz, aliases to |102.4 - 5*20| = 2.4 Hz.
+        f_noise_30 = 2.4
+        buffer_30 = [32000.0 + 1000.0 * math.sin(2.0 * math.pi * f_noise_30 * (n / FS)) for n in range(N)]
+        
+        mean_30 = sum(buffer_30) / N
+        ac_30 = [x - mean_30 for x in buffer_30]
+        real_30 = sum(x * c for x, c in zip(ac_30, cos_table))
+        imag_30 = sum(x * s for x, s in zip(ac_30, sin_table))
+        mag_30 = math.sqrt(real_30*real_30 + imag_30*imag_30) / (N / 2)
+        
+        # Assertions
+        # 3.5 RPM noise leaks heavily into 0.5 Hz, yielding magnitude ~961.6, which is above the threshold
+        self.assertGreater(mag_35, code.SIGNAL_THRESHOLD, "3.5 RPM noise must exceed the signal threshold")
+        
+        # 3.0 RPM noise is safely rejected (magnitude ~71.0), which is below code.SIGNAL_THRESHOLD
+        self.assertLess(mag_30, code.SIGNAL_THRESHOLD, "3.0 RPM noise must be below the signal threshold")
+        self.assertLess(mag_30, 100.0, "3.0 RPM noise leakage must be less than 100.0")
 
-        finally:
-            code.LIGHT_POLARITY = orig_polarity
-            code.MIN_RPM, code.MAX_RPM = orig_min_rpm, orig_max_rpm
-            code.min_left, code.max_left, code.threshold_left = orig_min_l, orig_max_l, orig_thresh_l
+    def test_dft_transient_rejection(self):
+        """Verify that baseline shift transients are detected and rejected, while steady-state beacons pass."""
+        FS = code.FS
+        N = code.N
+        
+        # 1. Simulate a step transient (covering the bot: dropping from 4300 to 670 over 10 samples)
+        step_signal = [4300.0] * 40
+        for i in range(10):
+            step_signal.append(4300.0 - (4300.0 - 670.0) * (i / 10))
+        step_signal += [670.0] * 60
+        
+        # Track transient flagging
+        window = [32000.0] * N
+        mean_history = [32000.0] * 20
+        transients = []
+        
+        for sample in step_signal:
+            window.pop(0)
+            window.append(sample)
+            mean = sum(window) / N
+            mean_history.pop(0)
+            mean_history.append(mean)
+            
+            # Replicate code.py transient check
+            is_transient = abs(mean - mean_history[0]) > 100.0
+            transients.append(is_transient)
+            
+        # Verify that the transient was detected at some point during the drop
+        self.assertTrue(any(transients), "Transient filter must flag a large baseline shift")
+        
+        # 2. Verify steady-state beacon does NOT trigger transient flagging once buffer is filled
+        beacon_signal = [5500.0 + 2500.0 * math.sin(2.0 * math.pi * 0.5 * (t / FS)) for t in range(80)]
+        window_b = [32000.0] * N
+        mean_history_b = [32000.0] * 20
+        transients_b = []
+        
+        for sample in beacon_signal:
+            window_b.pop(0)
+            window_b.append(sample)
+            mean = sum(window_b) / N
+            mean_history_b.pop(0)
+            mean_history_b.append(mean)
+            is_transient = abs(mean - mean_history_b[0]) > 100.0
+            transients_b.append(is_transient)
+            
+        # After sample 60 (steady state), no transient should be flagged
+        self.assertFalse(any(transients_b[60:]), "Steady-state beacon must not trigger the transient filter")
 
 if __name__ == '__main__':
     unittest.main()

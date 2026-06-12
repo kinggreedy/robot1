@@ -11,7 +11,7 @@ MIN_RPM = 5.0   # Minimum RPM when slowing down near light source
 MAX_RPM = 8.0   # Maximum RPM (user requested 8 max RPM)
 
 # Calibration parameters
-CALIBRATION_STEPS = 7022  # Number of steps to complete a full 360-degree rotation
+CALIBRATION_STEPS = 7680  # Number of steps to complete a full 360-degree rotation
 THRESHOLD_FRACTION = 0.6  # Threshold fraction above ambient
 UNIFORM_LIGHT_THRESHOLD = 3000  # Minimum difference to distinguish a light source from ambient
 LIGHT_POLARITY = 1        # 1 if more light increases sensor value (e.g. photodiode), -1 if it decreases

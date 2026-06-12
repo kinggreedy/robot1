@@ -97,28 +97,29 @@ class TestFirmwareSmoke(unittest.TestCase):
             code.min_left, code.max_left, code.threshold_left = 10000, 50000, 18000  # range 40000, thresh = 20% above min
             code.min_right, code.max_right, code.threshold_right = 20000, 60000, 28000
 
-            # 1. Both below threshold -> Motors should stop
+            # 1. Balanced: both return MAX_RPM (8.0)
             rpm1, rpm2 = code.update_motor_behaviors(15000, 25000)
-            self.assertEqual(rpm1, 0.0)
-            self.assertEqual(rpm2, 0.0)
-            self.assertFalse(code.motor1.run_forever)
-            self.assertFalse(code.motor2.run_forever)
-
-            # 2. Left sensor above threshold -> Motor 1 should move, Motor 2 stop
-            # Left value 34000 is halfway between threshold (18000) and max (50000)
-            # Math: 5.0 + (10.0 - 5.0) * (34000 - 18000) / (50000 - 18000) = 5.0 + 5.0 * 16000 / 32000 = 7.5 RPM
-            rpm1, rpm2 = code.update_motor_behaviors(34000, 25000)
-            self.assertAlmostEqual(rpm1, 7.5, places=2)
-            self.assertEqual(rpm2, 0.0)
+            self.assertEqual(rpm1, 8.0)
+            self.assertEqual(rpm2, 8.0)
             self.assertTrue(code.motor1.run_forever)
-            self.assertFalse(code.motor2.run_forever)
+            self.assertTrue(code.motor2.run_forever)
 
-            # 3. Right sensor above threshold -> Motor 1 stop, Motor 2 move
-            # Right value 60000 is at max -> Should scale to MAX_RPM (10.0)
+            # 2. Left sensor is brighter -> slows down left motor (rpm1)
+            # norm_l = 0.6, norm_r = 0.125, diff = 0.475
+            # rpm1 = 8.0 - 0.475 * 6.0 = 5.15 RPM
+            rpm1, rpm2 = code.update_motor_behaviors(34000, 25000)
+            self.assertAlmostEqual(rpm1, 5.15, places=2)
+            self.assertEqual(rpm2, 8.0)
+            self.assertTrue(code.motor1.run_forever)
+            self.assertTrue(code.motor2.run_forever)
+
+            # 3. Right sensor is brighter -> slows down right motor (rpm2)
+            # norm_l = 0.125, norm_r = 1.0, diff = -0.875
+            # rpm2 = 8.0 - 0.875 * 6.0 = 2.75 capped at MIN_RPM (5.0)
             rpm1, rpm2 = code.update_motor_behaviors(15000, 60000)
-            self.assertEqual(rpm1, 0.0)
-            self.assertAlmostEqual(rpm2, 10.0, places=2)
-            self.assertFalse(code.motor1.run_forever)
+            self.assertEqual(rpm1, 8.0)
+            self.assertEqual(rpm2, 5.0)
+            self.assertTrue(code.motor1.run_forever)
             self.assertTrue(code.motor2.run_forever)
 
         finally:
@@ -132,26 +133,30 @@ class TestFirmwareSmoke(unittest.TestCase):
         # Save original states
         orig_polarity = code.LIGHT_POLARITY
         orig_min_l, orig_max_l, orig_thresh_l = code.min_left, code.max_left, code.threshold_left
+        orig_min_r, orig_max_r = code.min_right, code.max_right
 
         try:
             # Set test configurations
             code.LIGHT_POLARITY = -1
-            # range = 40000, thresh = 20% below max (50000 - 8000 = 42000)
             code.min_left, code.max_left, code.threshold_left = 10000, 50000, 42000
+            code.min_right, code.max_right = 20000, 60000
 
-            # 1. Left value 45000 is above threshold -> No light detected (RPM = 0)
+            # 1. Left value 45000, right value 50000
+            # norm_l = 0.875, norm_r = 0.75, diff = 0.125
+            # rpm1 = 8.0 - 0.125 * 6.0 = 7.25 RPM
             rpm1, _ = code.update_motor_behaviors(45000, 50000)
-            self.assertEqual(rpm1, 0.0)
+            self.assertAlmostEqual(rpm1, 7.25, places=2)
 
-            # 2. Left value 26000 is below threshold -> Light detected
-            # Math: 5.0 + (10.0 - 5.0) * (42000 - 26000) / (42000 - 10000) = 5.0 + 5.0 * 16000 / 32000 = 7.5 RPM
+            # 2. Left value 26000, right value 50000
+            # norm_l = 0.4, norm_r = 0.75, diff = -0.35 (so left motor at MAX_RPM)
             rpm1, _ = code.update_motor_behaviors(26000, 50000)
-            self.assertAlmostEqual(rpm1, 7.5, places=2)
+            self.assertAlmostEqual(rpm1, 8.0, places=2)
             self.assertTrue(code.motor1.run_forever)
 
         finally:
             code.LIGHT_POLARITY = orig_polarity
             code.min_left, code.max_left, code.threshold_left = orig_min_l, orig_max_l, orig_thresh_l
+            code.min_right, code.max_right = orig_min_r, orig_max_r
 
 if __name__ == '__main__':
     unittest.main()

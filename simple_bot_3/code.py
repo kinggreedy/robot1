@@ -3,6 +3,7 @@ import digitalio
 import time
 import asyncio
 import analogio
+import math
 
 try:
     import supervisor
@@ -19,76 +20,40 @@ from motor import StepperMotor
 
 # Logging helper
 def log_message(msg):
-    print(f"[LOG] {msg}")
+    print(f"[Follower] {msg}")
     try:
         with open("/log.txt", "a") as f:
             f.write(f"{time.monotonic():.2f}: {msg}\n")
     except OSError:
         pass
 
+# --- Configuration ---
+BOT_ROLE = 2            # 1 = Leader (blinks 0.5Hz, no movement), 2 or 3 = Follower
+TARGET_FREQ = 0.5       # Blinking frequency of the leader's LEDs (0.5 Hz)
+MOVE_DIRECTION = -1     # -1 if robot moves forward on this chassis wiring, 1 if backward
+SENSOR_BALANCE = 1.0    # Balance multiplier: > 1.0 boosts Left sensor, < 1.0 boosts Right sensor
 
-# RPM Configuration
-MIN_RPM = 5.0   # Minimum RPM when slowing down near light source
-MAX_RPM = 8.0   # Maximum RPM
 
-# Calibration parameters
-CALIBRATION_STEPS = 8192  # Number of steps to complete a full 360-degree rotation (2048 per 90 deg)
-THRESHOLD_FRACTION = 0.6  # Threshold fraction above ambient
-UNIFORM_LIGHT_THRESHOLD = 3000  # Minimum difference to distinguish a light source from ambient
-LIGHT_POLARITY = 1        # 1 if more light increases sensor value (e.g. photodiode), -1 if it decreases
-FLASHLIGHT_MARGIN = 4000  # Margin above max ambient light to trigger flashlight mode
+# Motor speed limits
+MIN_RPM = 3.0
+MAX_RPM = 8.0
 
-# Motor direction for forward movement
-MOVE_DIRECTION = -1  # Set to -1 if robot moves backward during following, 1 if forward
+# DSP / Filter configuration
+FS = 20.0               # Sample rate in Hz (every 50ms)
+WINDOW_SEC = 2.0        # 2-second window to cover a full 0.5 Hz cycle
+N = int(FS * WINDOW_SEC)  # 40 samples
 
+# Detection Thresholds
+SIGNAL_THRESHOLD = 600.0  # Min magnitude sum to detect the leader
+CLOSE_SIGNAL = 2200.0     # Signal magnitude sum at which we are "Docked" (too close)
 
 # Setup motors
-motor1 = StepperMotor(
-    board.GP15,
-    board.GP16,
-    board.GP17,
-    board.GP18,
-    rpm=12
-)
+motor1 = StepperMotor(board.GP15, board.GP16, board.GP17, board.GP18, rpm=6.0)
+motor2 = StepperMotor(board.GP19, board.GP20, board.GP21, board.GP22, rpm=6.0)
 
-motor2 = StepperMotor(
-    board.GP19,
-    board.GP20,
-    board.GP21,
-    board.GP22,
-    rpm=12
-)
-
-# Setup light sensors (GP13 as Left, GP14 as Right)
-class SmartLightSensor:
-    def __init__(self, pin):
-        self._analog = None
-        self._digital = None
-        pin_name = str(pin).upper()
-        # On RP2040 chip, only GP26, GP27, GP28, GP29 are ADC analog pins.
-        if any(adc in pin_name for adc in ["GP26", "GP27", "GP28", "GP29"]):
-            try:
-                self._analog = analogio.AnalogIn(pin)
-                log_message(f"Initialized analog light sensor on {pin_name}")
-                return
-            except Exception:
-                pass
-        
-        self._digital = digitalio.DigitalInOut(pin)
-        self._digital.direction = digitalio.Direction.INPUT
-        log_message(f"Initialized digital light sensor on {pin_name}")
-
-    @property
-    def value(self):
-        if self._analog is not None:
-            return self._analog.value
-        else:
-            # Active-low sensor: returns 65535 when light is detected (DO goes LOW / False), 0 otherwise
-            return 0 if self._digital.value else 65535
-
-light_sensor_left = SmartLightSensor(board.GP13)
-light_sensor_right = SmartLightSensor(board.GP14)
-
+# Setup light sensors (GP26 as Left, GP27 as Right)
+light_sensor_left = analogio.AnalogIn(board.GP26)
+light_sensor_right = analogio.AnalogIn(board.GP27)
 
 # Setup Sonar Template (Trig=GP11, Echo=GP12) - currently not plugged in
 sonar = None
@@ -99,23 +64,20 @@ try:
 except Exception as e:
     log_message(f"Sonar template initialization skipped/failed: {e}")
 
-# Calibration state
-min_left, max_left = 65535, 0
-min_right, max_right = 65535, 0
-threshold_left = 0.0
-threshold_right = 0.0
-calibrated = False
-light_source_present = False
+# Global variables for DFT magnitudes and follower state
+mag_left = 0.0
+mag_right = 0.0
+state = "SEARCHING"  # States: "SEARCHING", "FOLLOWING", "DOCKED"
 
-# Guided mode state (triggered when flashlight is detected)
-guided_mode = False
+# Precompute Cosine and Sine DFT coefficients for efficiency
+cos_table = [math.cos(2.0 * math.pi * TARGET_FREQ * (n / FS)) for n in range(N)]
+sin_table = [math.sin(2.0 * math.pi * TARGET_FREQ * (n / FS)) for n in range(N)]
 
-# End indication state
-INDICATE_END = False
-stop_time = None
+# Precompute 1.0 Hz coefficients for NeoPixel crosstalk/reflection rejection
+cos_table_10 = [math.cos(2.0 * math.pi * 1.0 * (n / FS)) for n in range(N)]
+sin_table_10 = [math.sin(2.0 * math.pi * 1.0 * (n / FS)) for n in range(N)]
 
-
-# NeoPixel LED Control Task
+# NeoPixel LED Control Task (synchronized blinking + state-based speeds)
 async def control_leds():
     if neopixel is None:
         log_message("neopixel module not found. LED control disabled.")
@@ -140,260 +102,372 @@ async def control_leds():
             return (pos * 3, 0, 255 - pos * 3)
 
     log_message("NeoPixel control loop started on GP10.")
-    
+
     while True:
         t = time.monotonic()
-        
-        if INDICATE_END:
-            # Strobe red alert when finished / stopped
-            is_on = (t % 0.4) < 0.2
+
+        if BOT_ROLE == 1:
+            # Leader: blink at 0.5 Hz (1.0s ON, 1.0s OFF)
+            is_on = (t % 2.0) < 1.0
             if is_on:
-                pixels[0] = (255, 0, 0)
-                pixels[1] = (255, 0, 0)
+                pixels[0] = (255, 255, 255)
+                pixels[1] = (255, 255, 255)
             else:
                 pixels[0] = (0, 0, 0)
                 pixels[1] = (0, 0, 0)
         else:
-            # Normal: full beautiful RGB colorwheel cycle, blinking 1s on / 1s off in perfect sync (2s cycle)
-            both_on = (t % 2.0) < 1.0
-            hue = int(t * 50) % 256
-            
-            if both_on:
-                pixels[0] = color_wheel(hue)
-                pixels[1] = color_wheel((hue + 128) % 256)
+            # State-based blinking with static colors:
+            # - DOCKED: Solid Green (DC, no oscillation)
+            # - FOLLOWING: Fast blink Blue (4 Hz / 0.25s period)
+            # - SEARCHING: Slow blink Yellow/Orange (1 Hz / 1.0s period)
+            if state == "DOCKED":
+                is_on = True
+                color = (0, 255, 0)
+            elif state == "FOLLOWING":
+                is_on = (t % 0.25) < 0.125
+                color = (0, 0, 255)
+            else:  # SEARCHING
+                is_on = (t % 1.0) < 0.5
+                color = (255, 150, 0)
+
+            if is_on:
+                pixels[0] = color
+                pixels[1] = color
             else:
                 pixels[0] = (0, 0, 0)
                 pixels[1] = (0, 0, 0)
-                
+
         try:
             pixels.show()
         except Exception:
             pass
-            
+
         await asyncio.sleep(0.02)
 
+async def sample_sensors():
+    """
+    Samples sensors at 20 Hz, AC couples the signal, and computes DFT magnitude
+    at both 0.5 Hz (target) and 1.0 Hz (NeoPixel crosstalk blocker).
+    Rejects 0.5 Hz signals if the 1.0 Hz component dominates.
+    Uses a drift-corrected loop timing pattern to maintain exactly 20.0 Hz.
+    """
+    global mag_left, mag_right
 
-async def calibrate_sensors():
-    global min_left, max_left, min_right, max_right
-    global threshold_left, threshold_right, calibrated, light_source_present
+    # Initialize buffers with reference values
+    buffer_left = [32000.0] * N
+    buffer_right = [32000.0] * N
 
-    log_message("Starting calibration... Spinning 360 degrees to scan ambient light.")
+    # Initialize mean histories for transient/baseline shift rejection
+    mean_history_l = [32000.0] * 20
+    mean_history_r = [32000.0] * 20
 
-    # Spin in place: Motor 1 forward, Motor 2 reverse
-    motor1.set_rpm(6.0)
-    motor2.set_rpm(6.0)
-    motor1.move(CALIBRATION_STEPS)
-    motor2.move(-CALIBRATION_STEPS)
+    # Initialize median histories for spike/glitch rejection
+    median_history_l = [32000.0] * 5
+    median_history_r = [32000.0] * 5
 
-    min_l, max_l = 65535, 0
-    min_r, max_r = 65535, 0
+    sample_count = 0
+    next_sample = time.monotonic()
 
-    readings_history = []
-    best_pos = 0
-    best_smoothed_val = 0
-    min_smoothed_val = 65535
-
-    while motor1.busy or motor2.busy:
-        left_val = light_sensor_left.value
-        right_val = light_sensor_right.value
-
-        # Track raw min/max for normalization
-        if left_val < min_l: min_l = left_val
-        if left_val > max_l: max_l = left_val
-        if right_val < min_r: min_r = right_val
-        if right_val > max_r: max_r = right_val
-
-        # Calculate current average light and keep a history of size 5 for smoothing
-        avg_val = (left_val + right_val) / 2.0
-        readings_history.append(avg_val)
-        if len(readings_history) > 5:
-            readings_history.pop(0)
-
-        # Smooth reading to prevent peak light error
-        smoothed_val = sum(readings_history) / len(readings_history)
-
-        current_pos = motor1.position
-        if smoothed_val > best_smoothed_val:
-            best_smoothed_val = smoothed_val
-            best_pos = current_pos
-
-        if len(readings_history) == 5 and smoothed_val < min_smoothed_val:
-            min_smoothed_val = smoothed_val
-
-        print(f"Scanning... Pos: {current_pos}, L: {left_val}, R: {right_val}, Smoothed: {smoothed_val:.1f}")
-        await asyncio.sleep(0.05)
-
-    min_left, max_left = min_l, max_l
-    min_right, max_right = min_r, max_r
-
-    # Calculate thresholds
-    range_l = max_left - min_left
-    range_r = max_right - min_right
-    threshold_left = min_left + range_l * THRESHOLD_FRACTION
-    threshold_right = min_right + range_r * THRESHOLD_FRACTION
-
-    # Check if the environment has a distinct light source during scan
-    if (best_smoothed_val - min_smoothed_val) >= UNIFORM_LIGHT_THRESHOLD:
-        light_source_present = True
-        log_message(f"Brightest source detected! Rotating back to direction {best_pos}.")
-        # Rotate back to face the brightest source
-        motor1.move_to(best_pos)
-        motor2.move_to(-best_pos)
-        await wait_for_motors(motor1, motor2)
-    else:
-        light_source_present = False
-        log_message("Environment is uniform. Sticking to stationary mode until a bright light is detected.")
-
-    calibrated = True
-    log_message("Calibration finished!")
-    log_message(f"Left sensor: min={min_left}, max={max_left}, threshold={threshold_left:.1f}")
-    log_message(f"Right sensor: min={min_right}, max={max_right}, threshold={threshold_right:.1f}")
-
-async def wait_for_motors(*motors):
-    #Wait for the motors to finish rotating
-    while any(m.busy for m in motors):
-        await asyncio.sleep(0.01)
-
-def update_motor_behaviors(left_val, right_val):
-    # Determine if light is detected above/below threshold
-    light_detected_l = False
-    light_detected_r = False
-    rpm1 = 0.0
-    rpm2 = 0.0
-
-    if LIGHT_POLARITY == 1:
-        if left_val > threshold_left:
-            light_detected_l = True
-            denom = max(1, max_left - threshold_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((left_val - threshold_left) / denom)
-
-        if right_val > threshold_right:
-            light_detected_r = True
-            denom = max(1, max_right - threshold_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((right_val - threshold_right) / denom)
-    else:
-        if left_val < threshold_left:
-            light_detected_l = True
-            denom = max(1, threshold_left - min_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_left - left_val) / denom)
-
-        if right_val < threshold_right:
-            light_detected_r = True
-            denom = max(1, threshold_right - min_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_right - right_val) / denom)
-
-    # Apply motor controls based on light detection
-    if light_detected_l:
-        rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
-        motor1.set_rpm(rpm1)
-        if not motor1.run_forever:
-            motor1.move_forever(MOVE_DIRECTION)
-    else:
-        if motor1.run_forever:
-            motor1.stop()
-        rpm1 = 0.0
-
-    if light_detected_r:
-        rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
-        motor2.set_rpm(rpm2)
-        if not motor2.run_forever:
-            motor2.move_forever(MOVE_DIRECTION)
-    else:
-        if motor2.run_forever:
-            motor2.stop()
-        rpm2 = 0.0
-
-    return rpm1, rpm2
-
-#Loop for reading sensor values and updating motor speed
-async def read_sensors():
-    global light_source_present, guided_mode, INDICATE_END, stop_time
     while True:
-        if not calibrated:
-            await asyncio.sleep(0.1)
-            continue
+        # 1. 5x Burst Oversampling (Averaging) to reduce high-frequency noise
+        sum_raw_l = 0.0
+        sum_raw_r = 0.0
+        for _ in range(5):
+            sum_raw_l += float(light_sensor_left.value)
+            sum_raw_r += float(light_sensor_right.value)
+        raw_l = sum_raw_l / 5.0
+        raw_r = sum_raw_r / 5.0
 
-        # Read raw light values (0-65535)
-        left_val = light_sensor_left.value
-        right_val = light_sensor_right.value
+        # 2. Moving Median Filter (length 5) to reject spurious spikes/glitches
+        median_history_l.pop(0)
+        median_history_l.append(raw_l)
+        median_history_r.pop(0)
+        median_history_r.append(raw_r)
+        
+        val_l = sorted(median_history_l)[2]
+        val_r = sorted(median_history_r)[2]
 
-        # Detect if the super bright flashlight is active
-        flashlight_detected = (left_val > max_left + FLASHLIGHT_MARGIN) or (right_val > max_right + FLASHLIGHT_MARGIN)
+        # Shift buffers
+        buffer_left.pop(0)
+        buffer_left.append(val_l)
 
-        # Once flashlight is detected left or right, switch to guided mode
-        if flashlight_detected:
-            guided_mode = True
+        buffer_right.pop(0)
+        buffer_right.append(val_r)
 
-        # Determine if we should move:
-        # - In guided mode: only move if the flashlight is currently detected (super bright light active)
-        # - Otherwise: move if there was a light source during calibration and we are above threshold
-        if guided_mode:
-            should_move = flashlight_detected
+        # Efficient single-pass calculation of means
+        sum_l = 0.0
+        sum_r = 0.0
+        for i in range(N):
+            sum_l += buffer_left[i]
+            sum_r += buffer_right[i]
+        mean_l = sum_l / N
+        mean_r = sum_r / N
+
+        # Update mean histories
+        mean_history_l.pop(0)
+        mean_history_l.append(mean_l)
+        mean_history_r.pop(0)
+        mean_history_r.append(mean_r)
+
+        # Detect baseline shifts (transients) over 1.0 second (20 samples)
+        transient_l = abs(mean_l - mean_history_l[0]) > 100.0
+        transient_r = abs(mean_r - mean_history_r[0]) > 100.0
+
+        # Single-pass calculation of DFT coefficients for 0.5 Hz and 1.0 Hz
+        real_l_05 = 0.0
+        imag_l_05 = 0.0
+        real_r_05 = 0.0
+        imag_r_05 = 0.0
+
+        real_l_10 = 0.0
+        imag_l_10 = 0.0
+        real_r_10 = 0.0
+        imag_r_10 = 0.0
+
+        for i in range(N):
+            ac_val_l = buffer_left[i] - mean_l
+            ac_val_r = buffer_right[i] - mean_r
+
+            # 0.5 Hz coefficients
+            c05 = cos_table[i]
+            s05 = sin_table[i]
+            real_l_05 += ac_val_l * c05
+            imag_l_05 += ac_val_l * s05
+            real_r_05 += ac_val_r * c05
+            imag_r_05 += ac_val_r * s05
+
+            # 1.0 Hz coefficients
+            c10 = cos_table_10[i]
+            s10 = sin_table_10[i]
+            real_l_10 += ac_val_l * c10
+            imag_l_10 += ac_val_l * s10
+            real_r_10 += ac_val_r * c10
+            imag_r_10 += ac_val_r * s10
+
+        mag_l_05 = math.sqrt(real_l_05 * real_l_05 + imag_l_05 * imag_l_05) / (N / 2)
+        mag_r_05 = math.sqrt(real_r_05 * real_r_05 + imag_r_05 * imag_r_05) / (N / 2)
+
+        mag_l_10 = math.sqrt(real_l_10 * real_l_10 + imag_l_10 * imag_l_10) / (N / 2)
+        mag_r_10 = math.sqrt(real_r_10 * real_r_10 + imag_r_10 * imag_r_10) / (N / 2)
+
+        # Crosstalk blocking: if the 1.0 Hz signal is stronger than 0.5 Hz (or a significant fraction),
+        # it is our own status light or crosstalk, so reject it.
+        # Also reject signal if we are undergoing a baseline transient (ambient light shift).
+        if mag_l_10 > 0.8 * mag_l_05 or transient_l:
+            mag_left = 0.0
         else:
-            should_move = light_source_present and ((left_val > threshold_left) or (right_val > threshold_right))
+            mag_left = mag_l_05
 
-        if should_move:
-            rpm1, rpm2 = update_motor_behaviors(left_val, right_val)
-            # Reset stop timer and end indicator since we are moving
-            stop_time = None
-            INDICATE_END = False
+        if mag_r_10 > 0.8 * mag_r_05 or transient_r:
+            mag_right = 0.0
         else:
-            # Stop both motors if no light is detected above thresholds or initial condition had no source
-            if motor1.run_forever:
-                motor1.stop()
-            if motor2.run_forever:
-                motor2.stop()
-            rpm1 = 0.0
-            rpm2 = 0.0
+            mag_right = mag_r_05
 
-            # Start/check stop timer (tracks consecutive seconds of being stopped)
-            if stop_time is None:
-                stop_time = time.monotonic()
-            elif time.monotonic() - stop_time >= 10.0:
-                INDICATE_END = True
+        # Increment sample counter and log spectrum periodically
+        sample_count += 1
+        if sample_count % 10 == 0:
+            ac_l = [x - mean_l for x in buffer_left]
+            ac_r = [x - mean_r for x in buffer_right]
+            mags_l = {}
+            mags_r = {}
+            for k in range(1, 7):
+                real_l = 0.0
+                imag_l = 0.0
+                real_r = 0.0
+                imag_r = 0.0
+                for i in range(N):
+                    angle = 2.0 * math.pi * k * i / N
+                    cos_val = math.cos(angle)
+                    sin_val = math.sin(angle)
+                    real_l += ac_l[i] * cos_val
+                    imag_l += ac_l[i] * sin_val
+                    real_r += ac_r[i] * cos_val
+                    imag_r += ac_r[i] * sin_val
+                mags_l[k] = math.sqrt(real_l * real_l + imag_l * imag_l) / (N / 2)
+                mags_r[k] = math.sqrt(real_r * real_r + imag_r * imag_r) / (N / 2)
+            print(f"[Freq Log] Raw L: {val_l:.0f}, R: {val_r:.0f} | Mean L: {mean_l:.1f}, R: {mean_r:.1f}")
+            print(f"[Freq Log] L spectrum -> 0.5Hz: {mags_l[1]:.1f}, 1.0Hz: {mags_l[2]:.1f}, 1.5Hz: {mags_l[3]:.1f}, 2.0Hz: {mags_l[4]:.1f}, 2.5Hz: {mags_l[5]:.1f}, 3.0Hz: {mags_l[6]:.1f}")
+            print(f"[Freq Log] R spectrum -> 0.5Hz: {mags_r[1]:.1f}, 1.0Hz: {mags_r[2]:.1f}, 1.5Hz: {mags_r[3]:.1f}, 2.0Hz: {mags_r[4]:.1f}, 2.5Hz: {mags_r[5]:.1f}, 3.0Hz: {mags_r[6]:.1f}")
 
-        print(f"Sensors: L={left_val} (RPM={rpm1:.2f}), R={right_val} (RPM={rpm2:.2f}) | Guided={guided_mode} | Active={should_move} | End={INDICATE_END}")
+        # Precise drift-corrected timing loop
+        next_sample += 1.0 / FS
+        now = time.monotonic()
+        sleep_dur = next_sample - now
+        if sleep_dur > 0:
+            await asyncio.sleep(sleep_dur)
+        else:
+            # Under heavy load/jitter, reset next_sample target to now
+            next_sample = now
+            await asyncio.sleep(0)
 
+async def steer_robot():
+    """
+    State machine that controls motor speed and direction based on DFT magnitudes.
+    Uses Braitenberg-like emergent properties: speeds up the fainter side to turn.
+    Includes a signal-loss grace period to prevent stopping/spinning immediately after turns.
+    Calibrates sensor balance once at boot for 2.0s and locks it forever.
+    """
+    global state
+    last_known_dir = 1  # 1 = Left, -1 = Right
+    lost_signal_counter = 0
+    
+    # Store last calculated RPMs for use during the blind-follow grace period
+    last_rpm1 = 5.0
+    last_rpm2 = 5.0
+    searching_confirm_counter = 0
+    
+    # Track motor state to avoid redundant command calls
+    m1_active = False
+    m2_active = False
+    
+    def set_motors(run_m1, run_m2, dir_m1, dir_m2):
+        nonlocal m1_active, m2_active
+        if run_m1:
+            motor1.move_forever(dir_m1)
+            m1_active = True
+        elif m1_active:
+            motor1.stop()
+            m1_active = False
+            
+        if run_m2:
+            motor2.move_forever(dir_m2)
+            m2_active = True
+        elif m2_active:
+            motor2.stop()
+            m2_active = False
+
+    log_message("Starting 2-second boot calibration sequence (staying stationary)...")
+    boot_left = []
+    boot_right = []
+    # Collect samples at 20 Hz (every 50ms) for 2.0 seconds (40 samples)
+    for _ in range(40):
+        boot_left.append(float(light_sensor_left.value))
+        boot_right.append(float(light_sensor_right.value))
         await asyncio.sleep(0.05)
+        
+    avg_left = sum(boot_left) / 40.0
+    avg_right = sum(boot_right) / 40.0
+    
+    # Calculate fixed balance factor to balance sensor gains
+    if avg_left > 1.0:
+        auto_balance = avg_right / avg_left
+    else:
+        auto_balance = 1.0
+        
+    # Constrain balance factor between 0.5 and 2.0 for safety
+    auto_balance = max(0.5, min(2.0, auto_balance))
+    log_message(f"Boot calibration complete: Avg L={avg_left:.1f}, Avg R={avg_right:.1f} | Auto-Balance locked at: {auto_balance:.3f}")
 
+    log_message("Warming up DSP filters (3 seconds)...")
+    await asyncio.sleep(3.0)
+    log_message("Ready to follow 0.5 Hz beacon!")
+    
+    while True:
+        # Apply both manual baseline and dynamic auto-balance
+        balanced_left = mag_left * SENSOR_BALANCE * auto_balance
+        balanced_right = mag_right
+        total_signal = balanced_left + balanced_right
+        
+        # Track last known direction of the target if we have a decent signal
+        if total_signal >= SIGNAL_THRESHOLD:
+            last_known_dir = 1 if balanced_left > balanced_right else -1
+            if state == "SEARCHING":
+                searching_confirm_counter += 1
+        else:
+            searching_confirm_counter = 0
 
-async def rotate_360():
-    log_message("Starting 360-degree rotation task...")
+        # Check proximity threshold (Docking)
+        if total_signal >= CLOSE_SIGNAL:
+            state = "DOCKED"
+            lost_signal_counter = 0
+            set_motors(False, False, 0, 0)
+            print(f"[DOCKED] Target reached. Signal: {total_signal:.0f} (Left: {balanced_left:.1f}, Right: {balanced_right:.1f})")
+            
+        elif total_signal < SIGNAL_THRESHOLD:
+            # Check if we should use the blind-follow grace period before turning/spinning
+            if state == "FOLLOWING" and lost_signal_counter < 8:  # 8 iterations * 100ms = 800ms grace period
+                lost_signal_counter += 1
+                # Continue driving at last known speed
+                motor1.set_rpm(last_rpm1)
+                motor2.set_rpm(last_rpm2)
+                set_motors(True, True, MOVE_DIRECTION, MOVE_DIRECTION)
+                print(f"[GRACE PERIOD] Blind following... retry {lost_signal_counter}/8. Signal: {total_signal:.1f}")
+            else:
+                # Target lost: Spin slowly in place to search
+                state = "SEARCHING"
+                motor1.set_rpm(3.0)
+                motor2.set_rpm(3.0)
+                # Spin in last known direction of target (correcting search spin direction)
+                set_motors(True, True, -MOVE_DIRECTION * last_known_dir, MOVE_DIRECTION * last_known_dir)
+                print(f"[SEARCHING] Target lost. Signal: {total_signal:.1f}. Spinning {'LEFT' if last_known_dir > 0 else 'RIGHT'} to find leader...")
+            
+        else:
+            # Target in view: Follow leader using emergent steering behaviors
+            if state == "SEARCHING" and searching_confirm_counter < 5:
+                # Target detected but not confirmed yet: spin slowly and stay in SEARCHING
+                state = "SEARCHING"
+                motor1.set_rpm(3.0)
+                motor2.set_rpm(3.0)
+                set_motors(True, True, -MOVE_DIRECTION * last_known_dir, MOVE_DIRECTION * last_known_dir)
+                print(f"[SEARCHING] Target detected, confirming... ({searching_confirm_counter}/5) Signal: {total_signal:.1f}")
+            else:
+                state = "FOLLOWING"
+                lost_signal_counter = 0
+            
+            # Proportional difference normalized by total signal
+            diff = balanced_left - balanced_right
+            norm_diff = diff / total_signal if total_signal > 0 else 0.0
+            
+            # Since both motors run forward (even if MOVE_DIRECTION is negative),
+            # speeding up the right motor turns the robot left, and speeding up the left motor turns it right.
+            # No sign inversion is needed for steering.
+            effective_diff = norm_diff
+            
+            steer_gain = 4.5
+            base_rpm = 5.0
+            
+            # Emergent behavior: speed up the motor on the fainter side to turn towards the brighter side.
+            # Very small dead-band (0.005) to correct even tiny parallel drift offsets.
+            if effective_diff > 0.005:
+                # Right is fainter (Left is brighter): speed up Right motor (motor2) to turn Left
+                rpm1 = base_rpm
+                rpm2 = base_rpm + (effective_diff * steer_gain)
+            elif effective_diff < -0.005:
+                # Left is fainter (Right is brighter): speed up Left motor (motor1) to turn Right
+                rpm1 = base_rpm + (abs(effective_diff) * steer_gain)
+                rpm2 = base_rpm
+            else:
+                # Balanced: drive straight at base speed
+                rpm1 = base_rpm
+                rpm2 = base_rpm
+                
+            # Apply safety bounds
+            rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
+            rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
+            
+            # Cache last known speed for the grace period
+            last_rpm1 = rpm1
+            last_rpm2 = rpm2
+            
+            motor1.set_rpm(rpm1)
+            motor2.set_rpm(rpm2)
+            
+            set_motors(True, True, MOVE_DIRECTION, MOVE_DIRECTION)
+            print(f"[FOLLOWING] Mag: L={mag_left:4.0f} R={mag_right:4.0f} | Auto-Balance: {auto_balance:.3f} | Locked: True | Diff: {norm_diff:+.2f} | RPM: L={rpm1:.1f} R={rpm2:.1f}")
 
-    # Set speed for both motors
-    motor1.set_rpm(6.0)
-    motor2.set_rpm(6.0)
-
-    # Spin in place: Motor 1 forward, Motor 2 reverse
-    log_message(f"Commanding motor1 to move {CALIBRATION_STEPS} steps and motor2 to move {-CALIBRATION_STEPS} steps.")
-    motor1.move(CALIBRATION_STEPS)
-    motor2.move(-CALIBRATION_STEPS)
-
-    # Wait for completion while logging progress
-    while motor1.busy or motor2.busy:
-        log_message(f"Progress: Motor 1 pos = {motor1.position}/{motor1.target}, Motor 2 pos = {motor2.position}/{motor2.target}")
-        await asyncio.sleep(0.5)
-
-    log_message("360-degree rotation task complete. Stopping motors.")
-    motor1.stop()
-    motor2.stop()
-
+        await asyncio.sleep(0.1)
 
 async def main():
-    log_message("Booting up simple_bot_1...")
-
-    asyncio.create_task(motor1.run())
-    asyncio.create_task(motor2.run())
-    asyncio.create_task(control_leds())
-
-    # Rotate 360 degrees only (as configured by USER)
-    await rotate_360()
-
-    log_message("Finished 360-degree rotation. Entering idle loop.")
-    while True:
-        await asyncio.sleep(1)
+    if BOT_ROLE == 1:
+        log_message("Starting leader main loop (Role 1)...")
+        await control_leds()
+    else:
+        log_message(f"Starting follower main loop (Role {BOT_ROLE})...")
+        asyncio.create_task(motor1.run())
+        asyncio.create_task(motor2.run())
+        asyncio.create_task(control_leds())
+        asyncio.create_task(sample_sensors())
+        await steer_robot()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
