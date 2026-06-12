@@ -11,7 +11,7 @@ MIN_RPM = 5.0   # Minimum RPM when slowing down near light source
 MAX_RPM = 8.0   # Maximum RPM (user requested 8 max RPM)
 
 # Calibration parameters
-CALIBRATION_STEPS = 7022  # Number of steps to complete a full 360-degree rotation
+CALIBRATION_STEPS = 8192  # Number of steps to complete a full 360-degree rotation (2048 per 90 deg)
 THRESHOLD_FRACTION = 0.6  # Threshold fraction above ambient
 UNIFORM_LIGHT_THRESHOLD = 3000  # Minimum difference to distinguish a light source from ambient
 LIGHT_POLARITY = 1        # 1 if more light increases sensor value (e.g. photodiode), -1 if it decreases
@@ -222,9 +222,9 @@ def update_motor_behaviors(left_val, right_val):
     return rpm1, rpm2
 
 # Helper to get filtered sonar readings
-def get_filtered_sonar():
+def get_filtered_sonar(samples=3):
     readings = []
-    for _ in range(5):
+    for _ in range(samples):
         try:
             dist = sonar.distance
             # Filter out jumps (e.g. 800cm if too close) and invalid ranges
@@ -232,7 +232,7 @@ def get_filtered_sonar():
                 readings.append(dist)
         except Exception:
             pass
-        time.sleep(0.01)
+        time.sleep(0.005)
         
     if not readings:
         return None
@@ -241,17 +241,49 @@ def get_filtered_sonar():
     readings.sort()
     return readings[len(readings) // 2]
 
+
+# Rate-of-change robust filter for straight driving
+last_valid_dist = None
+glitch_count = 0
+
+def get_robust_sonar():
+    global last_valid_dist, glitch_count
+    current = get_filtered_sonar()
+    if current is None:
+        return None
+        
+    if last_valid_dist is not None:
+        diff = abs(current - last_valid_dist)
+        if diff > 15.0:
+            glitch_count += 1
+            if glitch_count < 3:
+                # Discard sudden jump, return last valid value
+                return last_valid_dist
+            else:
+                # Persistent change, accept it
+                last_valid_dist = current
+                glitch_count = 0
+                return current
+        else:
+            last_valid_dist = current
+            glitch_count = 0
+            return current
+    else:
+        last_valid_dist = current
+        glitch_count = 0
+        return current
+
 # Motor movement helpers
 async def drive_steps(steps, direction=MOVE_DIRECTION):
-    motor1.set_rpm(6.0)
-    motor2.set_rpm(6.0)
+    motor1.set_rpm(MAX_RPM)
+    motor2.set_rpm(MAX_RPM)
     motor1.move(steps * direction)
     motor2.move(steps * direction)
     await wait_for_motors(motor1, motor2)
 
 async def turn_degrees(degrees):
-    motor1.set_rpm(6.0)
-    motor2.set_rpm(6.0)
+    motor1.set_rpm(MAX_RPM)
+    motor2.set_rpm(MAX_RPM)
     steps = int(degrees * (CALIBRATION_STEPS / 360.0))
     motor1.move(steps)
     motor2.move(-steps)
@@ -293,6 +325,45 @@ async def perform_sweep():
 # Shape analysis helper functions
 import math
 
+def filter_sweep_spikes(angles, distances):
+    n = len(distances)
+    if n < 3:
+        return angles, distances
+        
+    clean_angles = []
+    clean_dists = []
+    
+    if distances[0] is not None:
+        clean_angles.append(angles[0])
+        clean_dists.append(distances[0])
+        
+    for i in range(1, n - 1):
+        prev_d = distances[i-1]
+        curr_d = distances[i]
+        next_d = distances[i+1]
+        
+        if curr_d is None:
+            continue
+            
+        if prev_d is not None and next_d is not None:
+            # Filter drop-out spikes (sudden dip)
+            if curr_d < prev_d - 12.0 and curr_d < next_d - 12.0:
+                print(f"    Filtered sweep dip: Angle={angles[i]} deg, Dist={curr_d:.1f} cm (neighbors: {prev_d:.1f}, {next_d:.1f})")
+                continue
+            # Filter spike peaks
+            if curr_d > prev_d + 12.0 and curr_d > next_d + 12.0:
+                print(f"    Filtered sweep peak: Angle={angles[i]} deg, Dist={curr_d:.1f} cm (neighbors: {prev_d:.1f}, {next_d:.1f})")
+                continue
+                
+        clean_angles.append(angles[i])
+        clean_dists.append(curr_d)
+        
+    if distances[-1] is not None:
+        clean_angles.append(angles[-1])
+        clean_dists.append(distances[-1])
+        
+    return clean_angles, clean_dists
+
 def fit_line_rmse(x, y):
     n = len(x)
     if n < 3:
@@ -316,9 +387,12 @@ def fit_line_rmse(x, y):
     return (rss / n)**0.5
 
 def analyze_sweep(angles, distances):
+    # Filter spikes first
+    angles, distances = filter_sweep_spikes(angles, distances)
+    
     obstacle_points = []
     for angle, dist in zip(angles, distances):
-        if dist < 45.0:
+        if dist is not None and dist < 45.0:
             obstacle_points.append((angle, dist))
             
     if len(obstacle_points) < 8:
@@ -373,6 +447,62 @@ def analyze_sweep(angles, distances):
     print(f"    Combined Score (min RMSE): {score:.3f} cm")
     return score
 
+async def find_obstacle_direction():
+    print("Performing initial 360-degree scan to locate center...")
+    angles = []
+    distances = []
+    
+    # 36 steps of 10 degrees = 360 degrees
+    step_deg = 10
+    num_steps = 36
+    
+    for i in range(num_steps):
+        dist = None
+        for _ in range(3):
+            dist = get_filtered_sonar()
+            if dist is not None:
+                break
+            await asyncio.sleep(0.01)
+            
+        current_angle = i * step_deg
+        angles.append(current_angle)
+        distances.append(dist)
+        print(f"  Scan: Angle={current_angle} deg, Dist={dist}")
+        
+        await turn_degrees(step_deg)
+        await asyncio.sleep(0.02)
+        
+    # Find longest contiguous open sector (dist > 30.0 cm) to identify diagonal pointing to center
+    n = len(angles)
+    is_open = [d is not None and d > 30.0 for d in distances]
+    double_open = is_open + is_open
+    
+    max_len = 0
+    best_start = 0
+    current_len = 0
+    current_start = 0
+    
+    for i in range(2 * n):
+        if double_open[i]:
+            if current_len == 0:
+                current_start = i
+            current_len += 1
+            if current_len > max_len:
+                max_len = current_len
+                best_start = current_start
+        else:
+            current_len = 0
+            
+    mid_index = (best_start + max_len // 2) % n
+    target_angle = angles[mid_index]
+    
+    print(f"Longest open sector starts at index {best_start} with length {max_len}.")
+    print(f"Target angle for center of room: {target_angle} degrees.")
+    
+    # Turn to target_angle
+    await turn_degrees(target_angle)
+    await asyncio.sleep(0.2)
+
 async def run_mapping_task():
     print("\n================================================")
     print("RUNNING TASK 2: OBSTACLE MAPPING & CLASSIFICATION")
@@ -381,73 +511,115 @@ async def run_mapping_task():
     led_red.value = False
     led_yellow.value = False
     
-    # Step 1: Drive forward until obstacle is close
-    print("Step 1: Locating obstacle...")
-    obstacle_found = False
-    total_steps = 0
-    max_drive_steps = 4000
+    # We skip find_obstacle_direction() at startup as it can be buggy and slow.
+    # The robot will naturally face the room's open space after bouncing off a corner wall if needed.
     
-    while total_steps < max_drive_steps:
-        dist = get_filtered_sonar()
-        if dist is not None:
-            print(f"  Sonar: {dist:.1f} cm")
-            if dist < 33.0:
-                print("  Obstacle detected! Stopping.")
-                obstacle_found = True
-                break
-        else:
-            print("  Sonar: Filtering (Invalid)")
+    while True:
+        consecutive_glitches = 0
+        
+        print("Step 1: Driving forward to locate object...")
+        object_found = False
+        
+        # Start motors driving forward
+        motor1.set_rpm(MAX_RPM)
+        motor2.set_rpm(MAX_RPM)
+        motor1.move_forever(MOVE_DIRECTION)
+        motor2.move_forever(MOVE_DIRECTION)
+        
+        close_count = 0
+        loop_count = 0
+        
+        try:
+            while True:
+                # 3 samples is fast, responsive, and filters transient spikes
+                dist = get_filtered_sonar(samples=3)
+                
+                if dist is not None:
+                    consecutive_glitches = 0
+                    
+                    # Print log only once every 5 iterations (~0.5s) to avoid spamming the console
+                    if loop_count % 5 == 0:
+                        print(f"  Sonar: {dist:.1f} cm")
+                    loop_count += 1
+                    
+                    if dist < 33.0:
+                        close_count += 1
+                        if close_count >= 2:
+                            print("  Object detected! Stopping.")
+                            object_found = True
+                            break
+                    else:
+                        close_count = 0
+                else:
+                    consecutive_glitches += 1
+                    if consecutive_glitches >= 8:
+                        print("  Sonar: Persistent glitch detected (8+ retries). Stopping to recover...")
+                        break
+                
+                await asyncio.sleep(0.05)
+        finally:
+            # Always ensure motors are stopped when exiting the driving loop
+            motor1.stop()
+            motor2.stop()
+            await wait_for_motors(motor1, motor2)
             
-        await drive_steps(50)
-        total_steps += 50
-        await asyncio.sleep(0.05)
+        if not object_found:
+            print("  No object detected or glitch recovery triggered. Backing up and turning...")
+            await drive_steps(2000, direction=-MOVE_DIRECTION) # Back up ~11 cm
+            await turn_degrees(80) # Turn 80 degrees to face a new direction
+            continue
+            
+        # Perform sweep
+        angles, dists = await perform_sweep()
         
-    if not obstacle_found:
-        print("Error: Obstacle not located!")
-        for _ in range(5):
-            led_red.value = True; led_yellow.value = True
+        valid_dists = [d for d in dists if d is not None]
+        if not valid_dists:
+            print("  Error: Sweep returned no valid distances. Backing up and turning...")
+            await drive_steps(2000, direction=-MOVE_DIRECTION)
+            await turn_degrees(100)
+            continue
+            
+        max_d = max(valid_dists)
+        print(f"  Sweep max distance: {max_d:.1f} cm")
+        
+        if max_d < 50.0:
+            print("  Detected a WALL. Bouncing...")
+            await drive_steps(3500, direction=-MOVE_DIRECTION) # Back up 19 cm
+            await turn_degrees(110) # Turn 110 degrees
             await asyncio.sleep(0.2)
-            led_red.value = False; led_yellow.value = False
-            await asyncio.sleep(0.2)
-        return
-        
-    # Step 2: Scan 1
-    print("\n--- Scan 1 ---")
-    angles1, dists1 = await perform_sweep()
-    score1 = analyze_sweep(angles1, dists1)
-    
-    # Step 3: Move slightly closer and Scan 2
-    print("\nStep 3: Moving closer for Scan 2...")
-    await drive_steps(150)
-    await asyncio.sleep(0.5)
-    
-    print("\n--- Scan 2 ---")
-    angles2, dists2 = await perform_sweep()
-    score2 = analyze_sweep(angles2, dists2)
-    
-    # Combine scores
-    scores = [s for s in [score1, score2] if s is not None]
-    if not scores:
-        print("Error: Both scans failed!")
-        return
-        
-    avg_score = sum(scores) / len(scores)
-    print(f"\nAverage Shape Score: {avg_score:.3f} cm")
-    
-    # Step 4: Classify and Indicate via LEDs
-    # Threshold is 0.18 cm
-    is_triangle = avg_score < 0.18
-    
-    if is_triangle:
-        print("\n>>> CLASSIFICATION: TRIANGLE <<<")
-        led_red.value = True
-        led_yellow.value = False
-    else:
-        print("\n>>> CLASSIFICATION: CIRCLE <<<")
-        led_yellow.value = True
-        led_red.value = False
-        
-    print("Task complete. Decision LED is active.")
+        else:
+            print("  Detected the OBSTACLE!")
+            score1 = analyze_sweep(angles, dists)
+            
+            print("  Moving closer for Scan 2...")
+            await drive_steps(1500) # Move 8 cm closer
+            await asyncio.sleep(0.5)
+            
+            angles2, dists2 = await perform_sweep()
+            score2 = analyze_sweep(angles2, dists2)
+            
+            scores = [s for s in [score1, score2] if s is not None]
+            if not scores:
+                print("  Error: Both scans failed. Retrying search...")
+                await drive_steps(3500, direction=-MOVE_DIRECTION)
+                await turn_degrees(110)
+                continue
+                
+            avg_score = sum(scores) / len(scores)
+            print(f"\nAverage Shape Score: {avg_score:.3f} cm")
+            
+            is_triangle = avg_score < 0.18
+            if is_triangle:
+                print("\n>>> CLASSIFICATION: TRIANGLE <<<")
+                led_red.value = True
+                led_yellow.value = False
+            else:
+                print("\n>>> CLASSIFICATION: CIRCLE <<<")
+                led_yellow.value = True
+                led_red.value = False
+                
+            print("Task complete. Decision LED is active.")
+            break
 
 async def main():
     asyncio.create_task(motor1.run())

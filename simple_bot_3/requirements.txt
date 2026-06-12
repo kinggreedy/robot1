@@ -1,0 +1,5 @@
+adafruit-circuitpython-motor
+adafruit-circuitpython-asyncio
+adafruit-circuitpython-ticks
+adafruit-circuitpython-neopixel
+adafruit-circuitpython-hcsr04

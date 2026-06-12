@@ -132,6 +132,18 @@ class TestFirmwareSmoke(unittest.TestCase):
         score_circle = code.analyze_sweep(angles, dists_circle)
         self.assertIsNotNone(score_circle)
         self.assertGreater(score_circle, 0.2)
+    def test_filter_sweep_spikes(self):
+        """Verify that filter_sweep_spikes detects and removes sudden dips/peaks."""
+        angles = [0, 2, 4, 6, 8]
+        # Includes a sudden dip of 10.0 (normally ~30) and a sudden peak of 50.0
+        dists = [30.0, 10.0, 31.0, 50.0, 30.0]
+        
+        clean_angles, clean_dists = code.filter_sweep_spikes(angles, dists)
+        
+        # Dip at index 1 and peak at index 3 should be removed
+        self.assertEqual(len(clean_dists), 3)
+        self.assertEqual(clean_dists, [30.0, 31.0, 30.0])
+        self.assertEqual(clean_angles, [0, 4, 8])
 
 if __name__ == '__main__':
     unittest.main()
