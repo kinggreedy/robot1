@@ -154,16 +154,16 @@ async def control_leds():
                 pixels[0] = (0, 0, 0)
                 pixels[1] = (0, 0, 0)
         else:
-            # Normal: full beautiful RGB colorwheel cycle, alternating 1s on / 1s off (left first, right next) in a 2s cycle
-            left_on = (t % 2.0) < 1.0
+            # Normal: full beautiful RGB colorwheel cycle, blinking 1s on / 1s off in perfect sync (2s cycle)
+            both_on = (t % 2.0) < 1.0
             hue = int(t * 50) % 256
             
-            if left_on:
+            if both_on:
                 pixels[0] = color_wheel(hue)
-                pixels[1] = (0, 0, 0)
+                pixels[1] = color_wheel((hue + 128) % 256)
             else:
                 pixels[0] = (0, 0, 0)
-                pixels[1] = color_wheel((hue + 128) % 256)
+                pixels[1] = (0, 0, 0)
                 
         try:
             pixels.show()
@@ -395,3 +395,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
