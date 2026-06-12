@@ -4,32 +4,11 @@ import time
 import asyncio
 import analogio
 
-try:
-    import supervisor
-    usb_connected = supervisor.runtime.usb_connected
-except (ImportError, AttributeError):
-    usb_connected = True
-
-try:
-    import neopixel
-except ImportError:
-    neopixel = None
-
 from motor import StepperMotor
-
-# Logging helper
-def log_message(msg):
-    print(f"[LOG] {msg}")
-    try:
-        with open("/log.txt", "a") as f:
-            f.write(f"{time.monotonic():.2f}: {msg}\n")
-    except OSError:
-        pass
-
 
 # RPM Configuration
 MIN_RPM = 5.0   # Minimum RPM when slowing down near light source
-MAX_RPM = 8.0   # Maximum RPM
+MAX_RPM = 8.0   # Maximum RPM (user requested 8 max RPM)
 
 # Calibration parameters
 CALIBRATION_STEPS = 8192  # Number of steps to complete a full 360-degree rotation (2048 per 90 deg)
@@ -42,7 +21,7 @@ FLASHLIGHT_MARGIN = 4000  # Margin above max ambient light to trigger flashlight
 MOVE_DIRECTION = -1  # Set to -1 if robot moves backward during following, 1 if forward
 
 
-# Setup motors
+#Setup motors
 motor1 = StepperMotor(
     board.GP15,
     board.GP16,
@@ -59,45 +38,38 @@ motor2 = StepperMotor(
     rpm=12
 )
 
-# Setup light sensors (GP13 as Left, GP14 as Right)
-class SmartLightSensor:
-    def __init__(self, pin):
-        self._analog = None
-        self._digital = None
-        pin_name = str(pin).upper()
-        # On RP2040 chip, only GP26, GP27, GP28, GP29 are ADC analog pins.
-        if any(adc in pin_name for adc in ["GP26", "GP27", "GP28", "GP29"]):
-            try:
-                self._analog = analogio.AnalogIn(pin)
-                log_message(f"Initialized analog light sensor on {pin_name}")
-                return
-            except Exception:
-                pass
-        
-        self._digital = digitalio.DigitalInOut(pin)
-        self._digital.direction = digitalio.Direction.INPUT
-        log_message(f"Initialized digital light sensor on {pin_name}")
+# Setup light sensors (GP26 and GP27 as analog inputs)
+light_sensor_left = analogio.AnalogIn(board.GP26)
+light_sensor_right = analogio.AnalogIn(board.GP27)
 
-    @property
-    def value(self):
-        if self._analog is not None:
-            return self._analog.value
-        else:
-            # Active-low sensor: returns 65535 when light is detected (DO goes LOW / False), 0 otherwise
-            return 0 if self._digital.value else 65535
+# Setup LEDs (GP10 as Red LED, GP11 as Yellow LED)
+led_red = digitalio.DigitalInOut(board.GP10)
+led_red.direction = digitalio.Direction.OUTPUT
+led_red.value = False
 
-light_sensor_left = SmartLightSensor(board.GP13)
-light_sensor_right = SmartLightSensor(board.GP14)
+led_yellow = digitalio.DigitalInOut(board.GP11)
+led_yellow.direction = digitalio.Direction.OUTPUT
+led_yellow.value = False
 
-
-# Setup Sonar Template (Trig=GP11, Echo=GP12) - currently not plugged in
+# Setup Sonar (Trig=GP13, Echo=GP12)
 sonar = None
 try:
     import adafruit_hcsr04
-    sonar = adafruit_hcsr04.HCSR04(trigger_pin=board.GP11, echo_pin=board.GP12)
-    log_message("Sonar sensor template initialized (not plugged in).")
+    sonar = adafruit_hcsr04.HCSR04(trigger_pin=board.GP13, echo_pin=board.GP12)
+    print("Sonar sensor initialized successfully.")
 except Exception as e:
-    log_message(f"Sonar template initialization skipped/failed: {e}")
+    print(f"Error initializing Sonar sensor: {e}")
+
+# Setup Color Sensor APDS-9960 (I2C: SCL=GP1, SDA=GP0)
+apds = None
+try:
+    import busio
+    from adafruit_apds9960.apds9960 import APDS9960
+    i2c = busio.I2C(board.GP1, board.GP0)
+    apds = APDS9960(i2c)
+    apds.enable_color = True
+except Exception:
+    pass
 
 # Calibration state
 min_left, max_left = 65535, 0
@@ -114,70 +86,11 @@ guided_mode = False
 INDICATE_END = False
 stop_time = None
 
-
-# NeoPixel LED Control Task
-async def control_leds():
-    if neopixel is None:
-        log_message("neopixel module not found. LED control disabled.")
-        return
-
-    try:
-        # 2 NeoPixels on GP10 (left first, right second in chain)
-        pixels = neopixel.NeoPixel(board.GP10, 2, brightness=0.3, auto_write=False)
-    except Exception as e:
-        log_message(f"Error initializing NeoPixels on GP10: {e}")
-        return
-
-    def color_wheel(pos):
-        pos = int(pos) % 256
-        if pos < 85:
-            return (255 - pos * 3, pos * 3, 0)
-        elif pos < 170:
-            pos -= 85
-            return (0, 255 - pos * 3, pos * 3)
-        else:
-            pos -= 170
-            return (pos * 3, 0, 255 - pos * 3)
-
-    log_message("NeoPixel control loop started on GP10.")
-    
-    while True:
-        t = time.monotonic()
-        
-        if INDICATE_END:
-            # Strobe red alert when finished / stopped
-            is_on = (t % 0.4) < 0.2
-            if is_on:
-                pixels[0] = (255, 0, 0)
-                pixels[1] = (255, 0, 0)
-            else:
-                pixels[0] = (0, 0, 0)
-                pixels[1] = (0, 0, 0)
-        else:
-            # Normal: full beautiful RGB colorwheel cycle, blinking 1s on / 1s off in perfect sync (2s cycle)
-            both_on = (t % 2.0) < 1.0
-            hue = int(t * 50) % 256
-            
-            if both_on:
-                pixels[0] = color_wheel(hue)
-                pixels[1] = color_wheel((hue + 128) % 256)
-            else:
-                pixels[0] = (0, 0, 0)
-                pixels[1] = (0, 0, 0)
-                
-        try:
-            pixels.show()
-        except Exception:
-            pass
-            
-        await asyncio.sleep(0.02)
-
-
 async def calibrate_sensors():
     global min_left, max_left, min_right, max_right
     global threshold_left, threshold_right, calibrated, light_source_present
 
-    log_message("Starting calibration... Spinning 360 degrees to scan ambient light.")
+    print("Starting calibration... Spinning 360 degrees to scan ambient light.")
 
     # Spin in place: Motor 1 forward, Motor 2 reverse
     motor1.set_rpm(6.0)
@@ -235,161 +148,483 @@ async def calibrate_sensors():
     # Check if the environment has a distinct light source during scan
     if (best_smoothed_val - min_smoothed_val) >= UNIFORM_LIGHT_THRESHOLD:
         light_source_present = True
-        log_message(f"Brightest source detected! Rotating back to direction {best_pos}.")
+        print(f"Brightest source detected! Rotating back to direction {best_pos}.")
         # Rotate back to face the brightest source
         motor1.move_to(best_pos)
         motor2.move_to(-best_pos)
         await wait_for_motors(motor1, motor2)
     else:
         light_source_present = False
-        log_message("Environment is uniform. Sticking to stationary mode until a bright light is detected.")
+        print("Environment is uniform. Sticking to stationary mode until a bright light is detected.")
 
     calibrated = True
-    log_message("Calibration finished!")
-    log_message(f"Left sensor: min={min_left}, max={max_left}, threshold={threshold_left:.1f}")
-    log_message(f"Right sensor: min={min_right}, max={max_right}, threshold={threshold_right:.1f}")
+    print("Calibration finished!")
+    print(f"Left sensor: min={min_left}, max={max_left}, threshold={threshold_left:.1f}")
+    print(f"Right sensor: min={min_right}, max={max_right}, threshold={threshold_right:.1f}")
 
 async def wait_for_motors(*motors):
     #Wait for the motors to finish rotating
     while any(m.busy for m in motors):
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
+
+
+#Example code for running a sequence of movements
+async def demo():
+    # Wait until calibration is complete
+    while not calibrated:
+        await asyncio.sleep(0.1)
+
+    # The read_sensors loop handles motor movement based on sensor inputs
+    while True:
+        await asyncio.sleep(1)
 
 def update_motor_behaviors(left_val, right_val):
-    # Determine if light is detected above/below threshold
-    light_detected_l = False
-    light_detected_r = False
-    rpm1 = 0.0
-    rpm2 = 0.0
+    # Normalize values relative to calibrated ambient range to handle mounting differences
+    range_l = max(1, max_left - min_left)
+    range_r = max(1, max_right - min_right)
+    norm_l = (left_val - min_left) / range_l
+    norm_r = (right_val - min_right) / range_r
 
-    if LIGHT_POLARITY == 1:
-        if left_val > threshold_left:
-            light_detected_l = True
-            denom = max(1, max_left - threshold_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((left_val - threshold_left) / denom)
+    # Base speeds
+    rpm1 = MAX_RPM
+    rpm2 = MAX_RPM
 
-        if right_val > threshold_right:
-            light_detected_r = True
-            denom = max(1, max_right - threshold_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((right_val - threshold_right) / denom)
+    # Steer towards the side with the higher normalized reading
+    # Slow down the motor on the brighter side (inverse steering)
+    diff = norm_l - norm_r
+    if diff > 0:
+        # Turn left: slow down left motor
+        rpm1 = MAX_RPM - diff * 6.0  # Steer gain
     else:
-        if left_val < threshold_left:
-            light_detected_l = True
-            denom = max(1, threshold_left - min_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_left - left_val) / denom)
+        # Turn right: slow down right motor
+        rpm2 = MAX_RPM - abs(diff) * 6.0
 
-        if right_val < threshold_right:
-            light_detected_r = True
-            denom = max(1, threshold_right - min_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_right - right_val) / denom)
+    # Slow down if both sensors are close to a bright source (large norm values)
+    avg_norm = (norm_l + norm_r) / 2.0
+    if avg_norm > 1.2:
+        scale = max(0.2, 1.0 - (avg_norm - 1.2) * 0.5)
+        rpm1 *= scale
+        rpm2 *= scale
 
-    # Apply motor controls based on light detection
-    if light_detected_l:
-        rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
-        motor1.set_rpm(rpm1)
-        if not motor1.run_forever:
-            motor1.move_forever(MOVE_DIRECTION)
-    else:
-        if motor1.run_forever:
-            motor1.stop()
-        rpm1 = 0.0
+    # Apply safety bounds
+    rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
+    rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
 
-    if light_detected_r:
-        rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
-        motor2.set_rpm(rpm2)
-        if not motor2.run_forever:
-            motor2.move_forever(MOVE_DIRECTION)
-    else:
-        if motor2.run_forever:
-            motor2.stop()
-        rpm2 = 0.0
+    # Set motor speeds and start them if not running
+    motor1.set_rpm(rpm1)
+    if not motor1.run_forever:
+        motor1.move_forever(MOVE_DIRECTION)
+
+    motor2.set_rpm(rpm2)
+    if not motor2.run_forever:
+        motor2.move_forever(MOVE_DIRECTION)
 
     return rpm1, rpm2
 
-#Loop for reading sensor values and updating motor speed
-async def read_sensors():
-    global light_source_present, guided_mode, INDICATE_END, stop_time
-    while True:
-        if not calibrated:
-            await asyncio.sleep(0.1)
+# Helper to get filtered sonar readings
+def get_filtered_sonar(samples=3):
+    readings = []
+    for _ in range(samples):
+        try:
+            dist = sonar.distance
+            # Filter out jumps (e.g. 800cm if too close) and invalid ranges
+            if 2.0 <= dist <= 250.0:
+                readings.append(dist)
+        except Exception:
+            pass
+        time.sleep(0.005)
+        
+    if not readings:
+        return None
+    
+    # Return median
+    readings.sort()
+    return readings[len(readings) // 2]
+
+
+# Rate-of-change robust filter for straight driving
+last_valid_dist = None
+glitch_count = 0
+
+def get_robust_sonar():
+    global last_valid_dist, glitch_count
+    current = get_filtered_sonar()
+    if current is None:
+        return None
+        
+    if last_valid_dist is not None:
+        diff = abs(current - last_valid_dist)
+        if diff > 15.0:
+            glitch_count += 1
+            if glitch_count < 3:
+                # Discard sudden jump, return last valid value
+                return last_valid_dist
+            else:
+                # Persistent change, accept it
+                last_valid_dist = current
+                glitch_count = 0
+                return current
+        else:
+            last_valid_dist = current
+            glitch_count = 0
+            return current
+    else:
+        last_valid_dist = current
+        glitch_count = 0
+        return current
+
+# Motor movement helpers
+async def drive_steps(steps, direction=MOVE_DIRECTION):
+    motor1.set_rpm(MAX_RPM)
+    motor2.set_rpm(MAX_RPM)
+    motor1.move(steps * direction)
+    motor2.move(steps * direction)
+    await wait_for_motors(motor1, motor2)
+
+async def turn_degrees(degrees):
+    motor1.set_rpm(MAX_RPM)
+    motor2.set_rpm(MAX_RPM)
+    steps = int(degrees * (CALIBRATION_STEPS / 360.0))
+    motor1.move(steps)
+    motor2.move(-steps)
+    await wait_for_motors(motor1, motor2)
+
+# Sweep profile scan
+async def perform_sweep():
+    print("  Starting angular sweep of obstacle...")
+    await turn_degrees(-30)
+    
+    angles = []
+    distances = []
+    
+    step_deg = 2
+    num_steps = 30
+    
+    for i in range(num_steps + 1):
+        dist = None
+        for _ in range(3):
+            dist = get_filtered_sonar()
+            if dist is not None:
+                break
+            await asyncio.sleep(0.01)
+            
+        current_angle = -30 + i * step_deg
+        if dist is not None:
+            angles.append(current_angle)
+            distances.append(dist)
+            print(f"    Angle={current_angle} deg, Dist={dist:.1f} cm")
+        else:
+            print(f"    Angle={current_angle} deg, Dist=Invalid")
+            
+        if i < num_steps:
+            await turn_degrees(step_deg)
+            
+    await turn_degrees(-30)
+    return angles, distances
+
+# Shape analysis helper functions
+import math
+
+def filter_sweep_spikes(angles, distances):
+    n = len(distances)
+    if n < 3:
+        return angles, distances
+        
+    clean_angles = []
+    clean_dists = []
+    
+    if distances[0] is not None:
+        clean_angles.append(angles[0])
+        clean_dists.append(distances[0])
+        
+    for i in range(1, n - 1):
+        prev_d = distances[i-1]
+        curr_d = distances[i]
+        next_d = distances[i+1]
+        
+        if curr_d is None:
             continue
+            
+        if prev_d is not None and next_d is not None:
+            # Filter drop-out spikes (sudden dip)
+            if curr_d < prev_d - 12.0 and curr_d < next_d - 12.0:
+                print(f"    Filtered sweep dip: Angle={angles[i]} deg, Dist={curr_d:.1f} cm (neighbors: {prev_d:.1f}, {next_d:.1f})")
+                continue
+            # Filter spike peaks
+            if curr_d > prev_d + 12.0 and curr_d > next_d + 12.0:
+                print(f"    Filtered sweep peak: Angle={angles[i]} deg, Dist={curr_d:.1f} cm (neighbors: {prev_d:.1f}, {next_d:.1f})")
+                continue
+                
+        clean_angles.append(angles[i])
+        clean_dists.append(curr_d)
+        
+    if distances[-1] is not None:
+        clean_angles.append(angles[-1])
+        clean_dists.append(distances[-1])
+        
+    return clean_angles, clean_dists
 
-        # Read raw light values (0-65535)
-        left_val = light_sensor_left.value
-        right_val = light_sensor_right.value
+def fit_line_rmse(x, y):
+    n = len(x)
+    if n < 3:
+        return 0.0
+    sum_x = sum(x)
+    sum_y = sum(y)
+    sum_xx = sum(xi*xi for xi in x)
+    sum_yy = sum(yi*yi for yi in y)
+    sum_xy = sum(xi*yi for xi, yi in zip(x, y))
+    
+    denom = (n * sum_xx - sum_x * sum_x)
+    if abs(denom) < 1e-6:
+        # Near-vertical line
+        mean_x = sum_x / n
+        return (sum((xi - mean_x)**2 for xi in x) / n)**0.5
+        
+    m = (n * sum_xy - sum_x * sum_y) / denom
+    c = (sum_y - m * sum_x) / n
+    
+    rss = sum((yi - (m * xi + c))**2 for xi, yi in zip(x, y))
+    return (rss / n)**0.5
 
-        # Detect if the super bright flashlight is active
-        flashlight_detected = (left_val > max_left + FLASHLIGHT_MARGIN) or (right_val > max_right + FLASHLIGHT_MARGIN)
+def analyze_sweep(angles, distances):
+    # Filter spikes first
+    angles, distances = filter_sweep_spikes(angles, distances)
+    
+    obstacle_points = []
+    for angle, dist in zip(angles, distances):
+        if dist is not None and dist < 45.0:
+            obstacle_points.append((angle, dist))
+            
+    if len(obstacle_points) < 8:
+        print("    Error: Too few obstacle points detected in scan!")
+        return None
+        
+    # Find the closest point angle to align center
+    min_dist = min(p[1] for p in obstacle_points)
+    closest_p = [p for p in obstacle_points if p[1] == min_dist][0]
+    center_angle = closest_p[0]
+    
+    print(f"    Closest point: {min_dist:.1f} cm at {center_angle} degrees")
+    
+    x_all = []
+    y_all = []
+    rel_angles = []
+    
+    for angle, dist in obstacle_points:
+        rel_angle = angle - center_angle
+        rad = math.radians(rel_angle)
+        xi = dist * math.sin(rad)
+        yi = dist * math.cos(rad)
+        x_all.append(xi)
+        y_all.append(yi)
+        rel_angles.append(rel_angle)
+        
+    # Define three windows: Left, Right, Center
+    left_x, left_y = [], []
+    right_x, right_y = [], []
+    center_x, center_y = [], []
+    
+    for xi, yi, ra in zip(x_all, y_all, rel_angles):
+        if -24 <= ra <= 0:
+            left_x.append(xi)
+            left_y.append(yi)
+        if 0 <= ra <= 24:
+            right_x.append(xi)
+            right_y.append(yi)
+        if -12 <= ra <= 12:
+            center_x.append(xi)
+            center_y.append(yi)
+            
+    rmse_left = fit_line_rmse(left_x, left_y) if len(left_x) >= 4 else 99.0
+    rmse_right = fit_line_rmse(right_x, right_y) if len(right_x) >= 4 else 99.0
+    rmse_center = fit_line_rmse(center_x, center_y) if len(center_x) >= 4 else 99.0
+    
+    print(f"    Left RMSE ({len(left_x)} pts): {rmse_left:.3f} cm")
+    print(f"    Right RMSE ({len(right_x)} pts): {rmse_right:.3f} cm")
+    print(f"    Center RMSE ({len(center_x)} pts): {rmse_center:.3f} cm")
+    
+    score = min(rmse_left, rmse_right, rmse_center)
+    print(f"    Combined Score (min RMSE): {score:.3f} cm")
+    return score
 
-        # Once flashlight is detected left or right, switch to guided mode
-        if flashlight_detected:
-            guided_mode = True
-
-        # Determine if we should move:
-        # - In guided mode: only move if the flashlight is currently detected (super bright light active)
-        # - Otherwise: move if there was a light source during calibration and we are above threshold
-        if guided_mode:
-            should_move = flashlight_detected
+async def find_obstacle_direction():
+    print("Performing initial 360-degree scan to locate center...")
+    angles = []
+    distances = []
+    
+    # 36 steps of 10 degrees = 360 degrees
+    step_deg = 10
+    num_steps = 36
+    
+    for i in range(num_steps):
+        dist = None
+        for _ in range(3):
+            dist = get_filtered_sonar()
+            if dist is not None:
+                break
+            await asyncio.sleep(0.01)
+            
+        current_angle = i * step_deg
+        angles.append(current_angle)
+        distances.append(dist)
+        print(f"  Scan: Angle={current_angle} deg, Dist={dist}")
+        
+        await turn_degrees(step_deg)
+        await asyncio.sleep(0.02)
+        
+    # Find longest contiguous open sector (dist > 30.0 cm) to identify diagonal pointing to center
+    n = len(angles)
+    is_open = [d is not None and d > 30.0 for d in distances]
+    double_open = is_open + is_open
+    
+    max_len = 0
+    best_start = 0
+    current_len = 0
+    current_start = 0
+    
+    for i in range(2 * n):
+        if double_open[i]:
+            if current_len == 0:
+                current_start = i
+            current_len += 1
+            if current_len > max_len:
+                max_len = current_len
+                best_start = current_start
         else:
-            should_move = light_source_present and ((left_val > threshold_left) or (right_val > threshold_right))
+            current_len = 0
+            
+    mid_index = (best_start + max_len // 2) % n
+    target_angle = angles[mid_index]
+    
+    print(f"Longest open sector starts at index {best_start} with length {max_len}.")
+    print(f"Target angle for center of room: {target_angle} degrees.")
+    
+    # Turn to target_angle
+    await turn_degrees(target_angle)
+    await asyncio.sleep(0.2)
 
-        if should_move:
-            rpm1, rpm2 = update_motor_behaviors(left_val, right_val)
-            # Reset stop timer and end indicator since we are moving
-            stop_time = None
-            INDICATE_END = False
+async def run_mapping_task():
+    print("\n================================================")
+    print("RUNNING TASK 2: OBSTACLE MAPPING & CLASSIFICATION")
+    print("================================================\n")
+    
+    led_red.value = False
+    led_yellow.value = False
+    
+    # We skip find_obstacle_direction() at startup as it can be buggy and slow.
+    # The robot will naturally face the room's open space after bouncing off a corner wall if needed.
+    
+    while True:
+        consecutive_glitches = 0
+        
+        print("Step 1: Driving forward to locate object...")
+        object_found = False
+        
+        # Start motors driving forward
+        motor1.set_rpm(MAX_RPM)
+        motor2.set_rpm(MAX_RPM)
+        motor1.move_forever(MOVE_DIRECTION)
+        motor2.move_forever(MOVE_DIRECTION)
+        
+        close_count = 0
+        loop_count = 0
+        
+        try:
+            while True:
+                # 3 samples is fast, responsive, and filters transient spikes
+                dist = get_filtered_sonar(samples=3)
+                
+                if dist is not None:
+                    consecutive_glitches = 0
+                    
+                    # Print log only once every 5 iterations (~0.5s) to avoid spamming the console
+                    if loop_count % 5 == 0:
+                        print(f"  Sonar: {dist:.1f} cm")
+                    loop_count += 1
+                    
+                    if dist < 33.0:
+                        close_count += 1
+                        if close_count >= 2:
+                            print("  Object detected! Stopping.")
+                            object_found = True
+                            break
+                    else:
+                        close_count = 0
+                else:
+                    consecutive_glitches += 1
+                    if consecutive_glitches >= 8:
+                        print("  Sonar: Persistent glitch detected (8+ retries). Stopping to recover...")
+                        break
+                
+                await asyncio.sleep(0.05)
+        finally:
+            # Always ensure motors are stopped when exiting the driving loop
+            motor1.stop()
+            motor2.stop()
+            await wait_for_motors(motor1, motor2)
+            
+        if not object_found:
+            print("  No object detected or glitch recovery triggered. Backing up and turning...")
+            await drive_steps(2000, direction=-MOVE_DIRECTION) # Back up ~11 cm
+            await turn_degrees(80) # Turn 80 degrees to face a new direction
+            continue
+            
+        # Perform sweep
+        angles, dists = await perform_sweep()
+        
+        valid_dists = [d for d in dists if d is not None]
+        if not valid_dists:
+            print("  Error: Sweep returned no valid distances. Backing up and turning...")
+            await drive_steps(2000, direction=-MOVE_DIRECTION)
+            await turn_degrees(100)
+            continue
+            
+        max_d = max(valid_dists)
+        print(f"  Sweep max distance: {max_d:.1f} cm")
+        
+        if max_d < 50.0:
+            print("  Detected a WALL. Bouncing...")
+            await drive_steps(3500, direction=-MOVE_DIRECTION) # Back up 19 cm
+            await turn_degrees(110) # Turn 110 degrees
+            await asyncio.sleep(0.2)
         else:
-            # Stop both motors if no light is detected above thresholds or initial condition had no source
-            if motor1.run_forever:
-                motor1.stop()
-            if motor2.run_forever:
-                motor2.stop()
-            rpm1 = 0.0
-            rpm2 = 0.0
-
-            # Start/check stop timer (tracks consecutive seconds of being stopped)
-            if stop_time is None:
-                stop_time = time.monotonic()
-            elif time.monotonic() - stop_time >= 10.0:
-                INDICATE_END = True
-
-        print(f"Sensors: L={left_val} (RPM={rpm1:.2f}), R={right_val} (RPM={rpm2:.2f}) | Guided={guided_mode} | Active={should_move} | End={INDICATE_END}")
-
-        await asyncio.sleep(0.05)
-
-
-async def rotate_360():
-    log_message("Starting 360-degree rotation task...")
-
-    # Set speed for both motors
-    motor1.set_rpm(6.0)
-    motor2.set_rpm(6.0)
-
-    # Spin in place: Motor 1 forward, Motor 2 reverse
-    log_message(f"Commanding motor1 to move {CALIBRATION_STEPS} steps and motor2 to move {-CALIBRATION_STEPS} steps.")
-    motor1.move(CALIBRATION_STEPS)
-    motor2.move(-CALIBRATION_STEPS)
-
-    # Wait for completion while logging progress
-    while motor1.busy or motor2.busy:
-        log_message(f"Progress: Motor 1 pos = {motor1.position}/{motor1.target}, Motor 2 pos = {motor2.position}/{motor2.target}")
-        await asyncio.sleep(0.5)
-
-    log_message("360-degree rotation task complete. Stopping motors.")
-    motor1.stop()
-    motor2.stop()
-
+            print("  Detected the OBSTACLE!")
+            score1 = analyze_sweep(angles, dists)
+            
+            print("  Moving closer for Scan 2...")
+            await drive_steps(1500) # Move 8 cm closer
+            await asyncio.sleep(0.5)
+            
+            angles2, dists2 = await perform_sweep()
+            score2 = analyze_sweep(angles2, dists2)
+            
+            scores = [s for s in [score1, score2] if s is not None]
+            if not scores:
+                print("  Error: Both scans failed. Retrying search...")
+                await drive_steps(3500, direction=-MOVE_DIRECTION)
+                await turn_degrees(110)
+                continue
+                
+            avg_score = sum(scores) / len(scores)
+            print(f"\nAverage Shape Score: {avg_score:.3f} cm")
+            
+            is_triangle = avg_score < 0.18
+            if is_triangle:
+                print("\n>>> CLASSIFICATION: TRIANGLE <<<")
+                led_red.value = True
+                led_yellow.value = False
+            else:
+                print("\n>>> CLASSIFICATION: CIRCLE <<<")
+                led_yellow.value = True
+                led_red.value = False
+                
+            print("Task complete. Decision LED is active.")
+            break
 
 async def main():
-    log_message("Booting up simple_bot_1...")
-
     asyncio.create_task(motor1.run())
     asyncio.create_task(motor2.run())
-    asyncio.create_task(control_leds())
-
-    # Rotate 360 degrees only (as configured by USER)
-    await rotate_360()
-
-    log_message("Finished 360-degree rotation. Entering idle loop.")
+    await run_mapping_task()
     while True:
         await asyncio.sleep(1)
 

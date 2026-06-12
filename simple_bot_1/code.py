@@ -4,35 +4,14 @@ import time
 import asyncio
 import analogio
 
-try:
-    import supervisor
-    usb_connected = supervisor.runtime.usb_connected
-except (ImportError, AttributeError):
-    usb_connected = True
-
-try:
-    import neopixel
-except ImportError:
-    neopixel = None
-
 from motor import StepperMotor
-
-# Logging helper
-def log_message(msg):
-    print(f"[LOG] {msg}")
-    try:
-        with open("/log.txt", "a") as f:
-            f.write(f"{time.monotonic():.2f}: {msg}\n")
-    except OSError:
-        pass
-
 
 # RPM Configuration
 MIN_RPM = 5.0   # Minimum RPM when slowing down near light source
-MAX_RPM = 8.0   # Maximum RPM
+MAX_RPM = 8.0   # Maximum RPM (user requested 8 max RPM)
 
 # Calibration parameters
-CALIBRATION_STEPS = 8192  # Number of steps to complete a full 360-degree rotation (2048 per 90 deg)
+CALIBRATION_STEPS = 7022  # Number of steps to complete a full 360-degree rotation
 THRESHOLD_FRACTION = 0.6  # Threshold fraction above ambient
 UNIFORM_LIGHT_THRESHOLD = 3000  # Minimum difference to distinguish a light source from ambient
 LIGHT_POLARITY = 1        # 1 if more light increases sensor value (e.g. photodiode), -1 if it decreases
@@ -42,7 +21,7 @@ FLASHLIGHT_MARGIN = 4000  # Margin above max ambient light to trigger flashlight
 MOVE_DIRECTION = -1  # Set to -1 if robot moves backward during following, 1 if forward
 
 
-# Setup motors
+#Setup motors
 motor1 = StepperMotor(
     board.GP15,
     board.GP16,
@@ -59,45 +38,14 @@ motor2 = StepperMotor(
     rpm=12
 )
 
-# Setup light sensors (GP13 as Left, GP14 as Right)
-class SmartLightSensor:
-    def __init__(self, pin):
-        self._analog = None
-        self._digital = None
-        pin_name = str(pin).upper()
-        # On RP2040 chip, only GP26, GP27, GP28, GP29 are ADC analog pins.
-        if any(adc in pin_name for adc in ["GP26", "GP27", "GP28", "GP29"]):
-            try:
-                self._analog = analogio.AnalogIn(pin)
-                log_message(f"Initialized analog light sensor on {pin_name}")
-                return
-            except Exception:
-                pass
-        
-        self._digital = digitalio.DigitalInOut(pin)
-        self._digital.direction = digitalio.Direction.INPUT
-        log_message(f"Initialized digital light sensor on {pin_name}")
+# Setup light sensors (GP26 and GP27 as analog inputs)
+light_sensor_left = analogio.AnalogIn(board.GP26)
+light_sensor_right = analogio.AnalogIn(board.GP27)
 
-    @property
-    def value(self):
-        if self._analog is not None:
-            return self._analog.value
-        else:
-            # Active-low sensor: returns 65535 when light is detected (DO goes LOW / False), 0 otherwise
-            return 0 if self._digital.value else 65535
-
-light_sensor_left = SmartLightSensor(board.GP13)
-light_sensor_right = SmartLightSensor(board.GP14)
-
-
-# Setup Sonar Template (Trig=GP11, Echo=GP12) - currently not plugged in
-sonar = None
-try:
-    import adafruit_hcsr04
-    sonar = adafruit_hcsr04.HCSR04(trigger_pin=board.GP11, echo_pin=board.GP12)
-    log_message("Sonar sensor template initialized (not plugged in).")
-except Exception as e:
-    log_message(f"Sonar template initialization skipped/failed: {e}")
+# Setup LED (GP10 as digital output)
+led = digitalio.DigitalInOut(board.GP10)
+led.direction = digitalio.Direction.OUTPUT
+led.value = False
 
 # Calibration state
 min_left, max_left = 65535, 0
@@ -114,70 +62,11 @@ guided_mode = False
 INDICATE_END = False
 stop_time = None
 
-
-# NeoPixel LED Control Task
-async def control_leds():
-    if neopixel is None:
-        log_message("neopixel module not found. LED control disabled.")
-        return
-
-    try:
-        # 2 NeoPixels on GP10 (left first, right second in chain)
-        pixels = neopixel.NeoPixel(board.GP10, 2, brightness=0.3, auto_write=False)
-    except Exception as e:
-        log_message(f"Error initializing NeoPixels on GP10: {e}")
-        return
-
-    def color_wheel(pos):
-        pos = int(pos) % 256
-        if pos < 85:
-            return (255 - pos * 3, pos * 3, 0)
-        elif pos < 170:
-            pos -= 85
-            return (0, 255 - pos * 3, pos * 3)
-        else:
-            pos -= 170
-            return (pos * 3, 0, 255 - pos * 3)
-
-    log_message("NeoPixel control loop started on GP10.")
-    
-    while True:
-        t = time.monotonic()
-        
-        if INDICATE_END:
-            # Strobe red alert when finished / stopped
-            is_on = (t % 0.4) < 0.2
-            if is_on:
-                pixels[0] = (255, 0, 0)
-                pixels[1] = (255, 0, 0)
-            else:
-                pixels[0] = (0, 0, 0)
-                pixels[1] = (0, 0, 0)
-        else:
-            # Normal: full beautiful RGB colorwheel cycle, blinking 1s on / 1s off in perfect sync (2s cycle)
-            both_on = (t % 2.0) < 1.0
-            hue = int(t * 50) % 256
-            
-            if both_on:
-                pixels[0] = color_wheel(hue)
-                pixels[1] = color_wheel((hue + 128) % 256)
-            else:
-                pixels[0] = (0, 0, 0)
-                pixels[1] = (0, 0, 0)
-                
-        try:
-            pixels.show()
-        except Exception:
-            pass
-            
-        await asyncio.sleep(0.02)
-
-
 async def calibrate_sensors():
     global min_left, max_left, min_right, max_right
     global threshold_left, threshold_right, calibrated, light_source_present
 
-    log_message("Starting calibration... Spinning 360 degrees to scan ambient light.")
+    print("Starting calibration... Spinning 360 degrees to scan ambient light.")
 
     # Spin in place: Motor 1 forward, Motor 2 reverse
     motor1.set_rpm(6.0)
@@ -235,73 +124,76 @@ async def calibrate_sensors():
     # Check if the environment has a distinct light source during scan
     if (best_smoothed_val - min_smoothed_val) >= UNIFORM_LIGHT_THRESHOLD:
         light_source_present = True
-        log_message(f"Brightest source detected! Rotating back to direction {best_pos}.")
+        print(f"Brightest source detected! Rotating back to direction {best_pos}.")
         # Rotate back to face the brightest source
         motor1.move_to(best_pos)
         motor2.move_to(-best_pos)
         await wait_for_motors(motor1, motor2)
     else:
         light_source_present = False
-        log_message("Environment is uniform. Sticking to stationary mode until a bright light is detected.")
+        print("Environment is uniform. Sticking to stationary mode until a bright light is detected.")
 
     calibrated = True
-    log_message("Calibration finished!")
-    log_message(f"Left sensor: min={min_left}, max={max_left}, threshold={threshold_left:.1f}")
-    log_message(f"Right sensor: min={min_right}, max={max_right}, threshold={threshold_right:.1f}")
+    print("Calibration finished!")
+    print(f"Left sensor: min={min_left}, max={max_left}, threshold={threshold_left:.1f}")
+    print(f"Right sensor: min={min_right}, max={max_right}, threshold={threshold_right:.1f}")
 
 async def wait_for_motors(*motors):
     #Wait for the motors to finish rotating
     while any(m.busy for m in motors):
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
+
+
+#Example code for running a sequence of movements
+async def demo():
+    # Wait until calibration is complete
+    while not calibrated:
+        await asyncio.sleep(0.1)
+
+    # The read_sensors loop handles motor movement based on sensor inputs
+    while True:
+        await asyncio.sleep(1)
 
 def update_motor_behaviors(left_val, right_val):
-    # Determine if light is detected above/below threshold
-    light_detected_l = False
-    light_detected_r = False
-    rpm1 = 0.0
-    rpm2 = 0.0
+    # Normalize values relative to calibrated ambient range to handle mounting differences
+    range_l = max(1, max_left - min_left)
+    range_r = max(1, max_right - min_right)
+    norm_l = (left_val - min_left) / range_l
+    norm_r = (right_val - min_right) / range_r
 
-    if LIGHT_POLARITY == 1:
-        if left_val > threshold_left:
-            light_detected_l = True
-            denom = max(1, max_left - threshold_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((left_val - threshold_left) / denom)
+    # Base speeds
+    rpm1 = MAX_RPM
+    rpm2 = MAX_RPM
 
-        if right_val > threshold_right:
-            light_detected_r = True
-            denom = max(1, max_right - threshold_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((right_val - threshold_right) / denom)
+    # Steer towards the side with the higher normalized reading
+    # Slow down the motor on the brighter side (inverse steering)
+    diff = norm_l - norm_r
+    if diff > 0:
+        # Turn left: slow down left motor
+        rpm1 = MAX_RPM - diff * 6.0  # Steer gain
     else:
-        if left_val < threshold_left:
-            light_detected_l = True
-            denom = max(1, threshold_left - min_left)
-            rpm1 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_left - left_val) / denom)
+        # Turn right: slow down right motor
+        rpm2 = MAX_RPM - abs(diff) * 6.0
 
-        if right_val < threshold_right:
-            light_detected_r = True
-            denom = max(1, threshold_right - min_right)
-            rpm2 = MIN_RPM + (MAX_RPM - MIN_RPM) * ((threshold_right - right_val) / denom)
+    # Slow down if both sensors are close to a bright source (large norm values)
+    avg_norm = (norm_l + norm_r) / 2.0
+    if avg_norm > 1.2:
+        scale = max(0.2, 1.0 - (avg_norm - 1.2) * 0.5)
+        rpm1 *= scale
+        rpm2 *= scale
 
-    # Apply motor controls based on light detection
-    if light_detected_l:
-        rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
-        motor1.set_rpm(rpm1)
-        if not motor1.run_forever:
-            motor1.move_forever(MOVE_DIRECTION)
-    else:
-        if motor1.run_forever:
-            motor1.stop()
-        rpm1 = 0.0
+    # Apply safety bounds
+    rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
+    rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
 
-    if light_detected_r:
-        rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
-        motor2.set_rpm(rpm2)
-        if not motor2.run_forever:
-            motor2.move_forever(MOVE_DIRECTION)
-    else:
-        if motor2.run_forever:
-            motor2.stop()
-        rpm2 = 0.0
+    # Set motor speeds and start them if not running
+    motor1.set_rpm(rpm1)
+    if not motor1.run_forever:
+        motor1.move_forever(MOVE_DIRECTION)
+
+    motor2.set_rpm(rpm2)
+    if not motor2.run_forever:
+        motor2.move_forever(MOVE_DIRECTION)
 
     return rpm1, rpm2
 
@@ -352,46 +244,23 @@ async def read_sensors():
             elif time.monotonic() - stop_time >= 10.0:
                 INDICATE_END = True
 
+        # Update the LED output based on the INDICATE_END state
+        led.value = INDICATE_END
+
         print(f"Sensors: L={left_val} (RPM={rpm1:.2f}), R={right_val} (RPM={rpm2:.2f}) | Guided={guided_mode} | Active={should_move} | End={INDICATE_END}")
 
         await asyncio.sleep(0.05)
 
 
-async def rotate_360():
-    log_message("Starting 360-degree rotation task...")
-
-    # Set speed for both motors
-    motor1.set_rpm(6.0)
-    motor2.set_rpm(6.0)
-
-    # Spin in place: Motor 1 forward, Motor 2 reverse
-    log_message(f"Commanding motor1 to move {CALIBRATION_STEPS} steps and motor2 to move {-CALIBRATION_STEPS} steps.")
-    motor1.move(CALIBRATION_STEPS)
-    motor2.move(-CALIBRATION_STEPS)
-
-    # Wait for completion while logging progress
-    while motor1.busy or motor2.busy:
-        log_message(f"Progress: Motor 1 pos = {motor1.position}/{motor1.target}, Motor 2 pos = {motor2.position}/{motor2.target}")
-        await asyncio.sleep(0.5)
-
-    log_message("360-degree rotation task complete. Stopping motors.")
-    motor1.stop()
-    motor2.stop()
-
-
 async def main():
-    log_message("Booting up simple_bot_1...")
-
     asyncio.create_task(motor1.run())
     asyncio.create_task(motor2.run())
-    asyncio.create_task(control_leds())
-
-    # Rotate 360 degrees only (as configured by USER)
-    await rotate_360()
-
-    log_message("Finished 360-degree rotation. Entering idle loop.")
-    while True:
-        await asyncio.sleep(1)
+    # Start calibration
+    await calibrate_sensors()
+    # After calibration, start reading sensors
+    asyncio.create_task(read_sensors())
+    # Wait on demo
+    await demo()
 
 if __name__ == "__main__":
     asyncio.run(main())
