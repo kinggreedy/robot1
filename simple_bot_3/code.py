@@ -36,7 +36,7 @@ SENSOR_BALANCE = 1.0    # Balance multiplier: > 1.0 boosts Left sensor, < 1.0 bo
 
 # Motor speed limits
 MIN_RPM = 3.0
-MAX_RPM = 8.0
+MAX_RPM = 10.0
 
 # DSP / Filter configuration
 FS = 20.0               # Sample rate in Hz (every 50ms)
@@ -45,7 +45,11 @@ N = int(FS * WINDOW_SEC)  # 40 samples
 
 # Detection Thresholds
 SIGNAL_THRESHOLD = 600.0  # Min magnitude sum to detect the leader
-CLOSE_SIGNAL = 2200.0     # Signal magnitude sum at which we are "Docked" (too close)
+CLOSE_SIGNAL = 5000.0     # Signal magnitude sum at which we are "Docked" (too close)
+TRANSIENT_THRESHOLD = 5000.0 # Threshold to reject large baseline shifts (like covering with hand)
+
+# Calibration parameters
+CALIBRATION_STEPS = 7680    # Number of steps to complete a 360-degree rotation
 
 # Setup motors
 motor1 = StepperMotor(board.GP15, board.GP16, board.GP17, board.GP18, rpm=6.0)
@@ -64,9 +68,11 @@ try:
 except Exception as e:
     log_message(f"Sonar template initialization skipped/failed: {e}")
 
-# Global variables for DFT magnitudes and follower state
+# Global variables for DFT magnitudes, ambient levels, and follower state
 mag_left = 0.0
 mag_right = 0.0
+mean_left = 32000.0
+mean_right = 32000.0
 state = "SEARCHING"  # States: "SEARCHING", "FOLLOWING", "DOCKED"
 
 # Precompute Cosine and Sine DFT coefficients for efficiency
@@ -151,7 +157,7 @@ async def sample_sensors():
     Rejects 0.5 Hz signals if the 1.0 Hz component dominates.
     Uses a drift-corrected loop timing pattern to maintain exactly 20.0 Hz.
     """
-    global mag_left, mag_right
+    global mag_left, mag_right, mean_left, mean_right
 
     # Initialize buffers with reference values
     buffer_left = [32000.0] * N
@@ -202,6 +208,8 @@ async def sample_sensors():
             sum_r += buffer_right[i]
         mean_l = sum_l / N
         mean_r = sum_r / N
+        mean_left = mean_l
+        mean_right = mean_r
 
         # Update mean histories
         mean_history_l.pop(0)
@@ -209,9 +217,7 @@ async def sample_sensors():
         mean_history_r.pop(0)
         mean_history_r.append(mean_r)
 
-        # Detect baseline shifts (transients) over 1.0 second (20 samples)
-        transient_l = abs(mean_l - mean_history_l[0]) > 100.0
-        transient_r = abs(mean_r - mean_history_r[0]) > 100.0
+        # Transient detection moved below after magnitudes are computed
 
         # Single-pass calculation of DFT coefficients for 0.5 Hz and 1.0 Hz
         real_l_05 = 0.0
@@ -249,6 +255,13 @@ async def sample_sensors():
 
         mag_l_10 = math.sqrt(real_l_10 * real_l_10 + imag_l_10 * imag_l_10) / (N / 2)
         mag_r_10 = math.sqrt(real_r_10 * real_r_10 + imag_r_10 * imag_r_10) / (N / 2)
+
+        # Detect baseline shifts (transients) over 1.0 second (20 samples)
+        # Threshold scales dynamically with signal strength to avoid muting valid, strong blinks
+        thresh_l = max(100.0, 0.2 * mag_l_05)
+        thresh_r = max(100.0, 0.2 * mag_r_05)
+        transient_l = abs(mean_l - mean_history_l[0]) > thresh_l
+        transient_r = abs(mean_r - mean_history_r[0]) > thresh_r
 
         # Crosstalk blocking: if the 1.0 Hz signal is stronger than 0.5 Hz (or a significant fraction),
         # it is our own status light or crosstalk, so reject it.
@@ -302,24 +315,26 @@ async def sample_sensors():
 
 async def steer_robot():
     """
-    State machine that controls motor speed and direction based on DFT magnitudes.
-    Uses Braitenberg-like emergent properties: speeds up the fainter side to turn.
-    Includes a signal-loss grace period to prevent stopping/spinning immediately after turns.
-    Calibrates sensor balance once at boot for 2.0s and locks it forever.
+    State machine: SEARCHING -> sweep-through-peak -> ALIGNING -> FOLLOWING -> DOCKED.
+    Spins continuously to find the 0.5 Hz beacon. When the signal rises above
+    threshold, keeps spinning through the peak until the signal drops again.
+    This sweep-through pattern is the confirmation: false readings (0.1s spikes)
+    never sustain a bell curve. At the peak position, calibrates sensor balance
+    from the AC signal ratio (both sensors should see equal 0.5 Hz at center).
     """
     global state
-    last_known_dir = 1  # 1 = Left, -1 = Right
-    lost_signal_counter = 0
-    
-    # Store last calculated RPMs for use during the blind-follow grace period
+
+    # Steering / following state
     last_rpm1 = 5.0
     last_rpm2 = 5.0
-    searching_confirm_counter = 0
-    
+    lost_signal_counter = 0
+    auto_balance = 1.0
+    scan_direction = 1  # 1 = spin left, -1 = spin right
+
     # Track motor state to avoid redundant command calls
     m1_active = False
     m2_active = False
-    
+
     def set_motors(run_m1, run_m2, dir_m1, dir_m2):
         nonlocal m1_active, m2_active
         if run_m1:
@@ -328,7 +343,6 @@ async def steer_robot():
         elif m1_active:
             motor1.stop()
             m1_active = False
-            
         if run_m2:
             motor2.move_forever(dir_m2)
             m2_active = True
@@ -336,126 +350,201 @@ async def steer_robot():
             motor2.stop()
             m2_active = False
 
+    # Boot: stationary calibration (2 seconds, DC ambient only)
     log_message("Starting 2-second boot calibration sequence (staying stationary)...")
     boot_left = []
     boot_right = []
-    # Collect samples at 20 Hz (every 50ms) for 2.0 seconds (40 samples)
     for _ in range(40):
         boot_left.append(float(light_sensor_left.value))
         boot_right.append(float(light_sensor_right.value))
         await asyncio.sleep(0.05)
-        
     avg_left = sum(boot_left) / 40.0
     avg_right = sum(boot_right) / 40.0
-    
-    # Calculate fixed balance factor to balance sensor gains
     if avg_left > 1.0:
         auto_balance = avg_right / avg_left
     else:
         auto_balance = 1.0
-        
-    # Constrain balance factor between 0.5 and 2.0 for safety
     auto_balance = max(0.5, min(2.0, auto_balance))
-    log_message(f"Boot calibration complete: Avg L={avg_left:.1f}, Avg R={avg_right:.1f} | Auto-Balance locked at: {auto_balance:.3f}")
+    log_message(f"Boot calibration: Avg L={avg_left:.1f}, Avg R={avg_right:.1f} | Auto-Balance: {auto_balance:.3f}")
 
     log_message("Warming up DSP filters (3 seconds)...")
     await asyncio.sleep(3.0)
     log_message("Ready to follow 0.5 Hz beacon!")
-    
+
+    # Detection thresholds for sweep confirmation
+    MIN_DETECT_SAMPLES = 15  # At least 1.5 seconds of sustained signal above threshold
+    MAX_GAP = 3              # Allow up to 300ms of brief dips during detection
+
     while True:
-        # Apply both manual baseline and dynamic auto-balance
-        balanced_left = mag_left * SENSOR_BALANCE * auto_balance
-        balanced_right = mag_right
-        total_signal = balanced_left + balanced_right
-        
-        # Track last known direction of the target if we have a decent signal
-        if total_signal >= SIGNAL_THRESHOLD:
-            last_known_dir = 1 if balanced_left > balanced_right else -1
-            if state == "SEARCHING":
-                searching_confirm_counter += 1
-        else:
-            searching_confirm_counter = 0
+        # ===== SEARCHING: Spin continuously and sweep for the 0.5 Hz bell curve =====
+        state = "SEARCHING"
+        log_message(f"Searching for leader (spinning {'LEFT' if scan_direction > 0 else 'RIGHT'})...")
+        motor1.set_rpm(3.0)
+        motor2.set_rpm(3.0)
+        set_motors(True, True, -MOVE_DIRECTION * scan_direction, MOVE_DIRECTION * scan_direction)
 
-        # Check proximity threshold (Docking)
-        if total_signal >= CLOSE_SIGNAL:
-            state = "DOCKED"
-            lost_signal_counter = 0
-            set_motors(False, False, 0, 0)
-            print(f"[DOCKED] Target reached. Signal: {total_signal:.0f} (Left: {balanced_left:.1f}, Right: {balanced_right:.1f})")
-            
-        elif total_signal < SIGNAL_THRESHOLD:
-            # Check if we should use the blind-follow grace period before turning/spinning
-            if state == "FOLLOWING" and lost_signal_counter < 8:  # 8 iterations * 100ms = 800ms grace period
-                lost_signal_counter += 1
-                # Continue driving at last known speed
-                motor1.set_rpm(last_rpm1)
-                motor2.set_rpm(last_rpm2)
-                set_motors(True, True, MOVE_DIRECTION, MOVE_DIRECTION)
-                print(f"[GRACE PERIOD] Blind following... retry {lost_signal_counter}/8. Signal: {total_signal:.1f}")
-            else:
-                # Target lost: Spin slowly in place to search
-                state = "SEARCHING"
-                motor1.set_rpm(3.0)
-                motor2.set_rpm(3.0)
-                # Spin in last known direction of target (correcting search spin direction)
-                set_motors(True, True, -MOVE_DIRECTION * last_known_dir, MOVE_DIRECTION * last_known_dir)
-                print(f"[SEARCHING] Target lost. Signal: {total_signal:.1f}. Spinning {'LEFT' if last_known_dir > 0 else 'RIGHT'} to find leader...")
-            
-        else:
-            # Target in view: Follow leader using emergent steering behaviors
-            if state == "SEARCHING" and searching_confirm_counter < 5:
-                # Target detected but not confirmed yet: spin slowly and stay in SEARCHING
-                state = "SEARCHING"
-                motor1.set_rpm(3.0)
-                motor2.set_rpm(3.0)
-                set_motors(True, True, -MOVE_DIRECTION * last_known_dir, MOVE_DIRECTION * last_known_dir)
-                print(f"[SEARCHING] Target detected, confirming... ({searching_confirm_counter}/5) Signal: {total_signal:.1f}")
-            else:
-                state = "FOLLOWING"
-                lost_signal_counter = 0
-            
-            # Proportional difference normalized by total signal
-            diff = balanced_left - balanced_right
-            norm_diff = diff / total_signal if total_signal > 0 else 0.0
-            
-            # Since both motors run forward (even if MOVE_DIRECTION is negative),
-            # speeding up the right motor turns the robot left, and speeding up the left motor turns it right.
-            # No sign inversion is needed for steering.
-            effective_diff = norm_diff
-            
-            steer_gain = 4.5
-            base_rpm = 5.0
-            
-            # Emergent behavior: speed up the motor on the fainter side to turn towards the brighter side.
-            # Very small dead-band (0.005) to correct even tiny parallel drift offsets.
-            if effective_diff > 0.005:
-                # Right is fainter (Left is brighter): speed up Right motor (motor2) to turn Left
-                rpm1 = base_rpm
-                rpm2 = base_rpm + (effective_diff * steer_gain)
-            elif effective_diff < -0.005:
-                # Left is fainter (Right is brighter): speed up Left motor (motor1) to turn Right
-                rpm1 = base_rpm + (abs(effective_diff) * steer_gain)
-                rpm2 = base_rpm
-            else:
-                # Balanced: drive straight at base speed
-                rpm1 = base_rpm
-                rpm2 = base_rpm
-                
-            # Apply safety bounds
-            rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
-            rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
-            
-            # Cache last known speed for the grace period
-            last_rpm1 = rpm1
-            last_rpm2 = rpm2
-            
-            motor1.set_rpm(rpm1)
-            motor2.set_rpm(rpm2)
-            
-            set_motors(True, True, MOVE_DIRECTION, MOVE_DIRECTION)
-            print(f"[FOLLOWING] Mag: L={mag_left:4.0f} R={mag_right:4.0f} | Auto-Balance: {auto_balance:.3f} | Locked: True | Diff: {norm_diff:+.2f} | RPM: L={rpm1:.1f} R={rpm2:.1f}")
+        # Peak tracking variables
+        in_detection = False
+        peak_signal = 0.0
+        best_pos_m1 = motor1.position
+        best_pos_m2 = motor2.position
+        detect_samples = 0   # How many samples above threshold in this detection window
+        gap_count = 0         # Consecutive samples below threshold (tolerance for brief dips)
+        search_log_counter = 0
 
-        await asyncio.sleep(0.1)
+        while True:
+            balanced_left = mag_left * SENSOR_BALANCE * auto_balance
+            balanced_right = mag_right
+            total_signal = balanced_left + balanced_right
+
+            if total_signal >= SIGNAL_THRESHOLD:
+                gap_count = 0
+                detect_samples += 1
+
+                if not in_detection:
+                    in_detection = True
+                    print(f"[SEARCHING] Signal detected! ({total_signal:.1f}). Sweeping through peak...")
+
+                if total_signal > peak_signal:
+                    peak_signal = total_signal
+                    best_pos_m1 = motor1.position
+                    best_pos_m2 = motor2.position
+
+            elif in_detection:
+                gap_count += 1
+                if gap_count > MAX_GAP:
+                    # Signal dropped after sustained detection — we swept past the leader
+                    if detect_samples >= MIN_DETECT_SAMPLES:
+                        # Valid detection: sustained bell curve confirmed
+                        log_message(f"Leader confirmed ({detect_samples} samples, peak: {peak_signal:.1f}). Aligning to peak...")
+                        break
+                    else:
+                        # Too brief — false reading, keep spinning
+                        print(f"[SEARCHING] False alarm ({detect_samples} samples, needed {MIN_DETECT_SAMPLES}). Continuing search...")
+                        in_detection = False
+                        peak_signal = 0.0
+                        detect_samples = 0
+                        gap_count = 0
+
+            # Periodic search log (every 1 second)
+            search_log_counter += 1
+            if search_log_counter >= 10:
+                search_log_counter = 0
+                print(f"[SEARCHING] Signal: {total_signal:.1f} | Detecting: {in_detection} | Samples: {detect_samples}")
+
+            await asyncio.sleep(0.1)
+
+        # ===== ALIGNING: Stop and reverse to the peak position =====
+        set_motors(False, False, 0, 0)
+
+        motor1.set_rpm(3.0)
+        motor2.set_rpm(3.0)
+        motor1.move_to(best_pos_m1)
+        motor2.move_to(best_pos_m2)
+
+        while motor1.busy or motor2.busy:
+            await asyncio.sleep(0.05)
+
+        # Wait for DFT window to settle at the aligned position (2 seconds)
+        log_message("Alignment complete. Waiting for DFT to settle (2s)...")
+        await asyncio.sleep(2.0)
+
+        # Calibrate auto_balance from the 0.5 Hz AC magnitudes at the centered peak
+        # At center, both sensors see the leader equally; any difference is hardware mismatch
+        if mag_left > 10.0 and mag_right > 10.0:
+            auto_balance = mag_right / mag_left
+            auto_balance = max(0.5, min(2.0, auto_balance))
+            log_message(f"AC Calibration: mag_L={mag_left:.1f}, mag_R={mag_right:.1f} -> auto_balance={auto_balance:.3f}")
+        else:
+            log_message(f"Signal too weak for AC calibration (L={mag_left:.1f}, R={mag_right:.1f}). Keeping auto_balance={auto_balance:.3f}")
+
+        # ===== FOLLOWING / DOCKED cycle =====
+        state = "FOLLOWING"
+        lost_signal_counter = 0
+        steering_bias = 0.0
+        bias_direction = 0.01
+        last_total_signal = 0.0
+        bias_update_counter = 0
+        log_message("Entering following mode.")
+
+        while state != "SEARCHING":
+            balanced_left = mag_left * SENSOR_BALANCE * auto_balance
+            balanced_right = mag_right
+            total_signal = balanced_left + balanced_right
+            norm_diff = (balanced_left - balanced_right) / total_signal if total_signal > 0 else 0.0
+
+            if state == "FOLLOWING":
+                # Check proximity threshold (Docking) — must be aligned
+                is_aligned = abs(norm_diff) < 0.25
+                if total_signal >= CLOSE_SIGNAL and is_aligned:
+                    state = "DOCKED"
+                    set_motors(False, False, 0, 0)
+                    print(f"[DOCKED] Target reached. Signal: {total_signal:.0f} (Left: {balanced_left:.1f}, Right: {balanced_right:.1f})")
+
+                elif total_signal < SIGNAL_THRESHOLD:
+                    if lost_signal_counter < 8:  # 800ms grace period
+                        lost_signal_counter += 1
+                        motor1.set_rpm(last_rpm1)
+                        motor2.set_rpm(last_rpm2)
+                        set_motors(True, True, MOVE_DIRECTION, MOVE_DIRECTION)
+                        print(f"[GRACE PERIOD] Blind following... retry {lost_signal_counter}/8. Signal: {total_signal:.1f}")
+                    else:
+                        set_motors(False, False, 0, 0)
+                        log_message(f"Target lost (Signal: {total_signal:.1f}). Re-entering scan.")
+                        state = "SEARCHING"
+
+                else:
+                    lost_signal_counter = 0
+
+                    # Update active wiggle bias every 1.0 second
+                    bias_update_counter += 1
+                    if bias_update_counter >= 10:
+                        bias_update_counter = 0
+                        if last_total_signal > 0.0:
+                            if total_signal > last_total_signal:
+                                steering_bias += bias_direction
+                            else:
+                                bias_direction = -bias_direction
+                                steering_bias += bias_direction
+                            steering_bias = max(-0.3, min(0.3, steering_bias))
+                        last_total_signal = total_signal
+
+                    # Apply Braitenberg steering with wiggle bias
+                    effective_diff = norm_diff + steering_bias
+                    steer_gain = 4.5
+                    base_rpm = 5.0
+
+                    if effective_diff > 0.005:
+                        rpm1 = base_rpm
+                        rpm2 = base_rpm + (effective_diff * steer_gain)
+                    elif effective_diff < -0.005:
+                        rpm1 = base_rpm + (abs(effective_diff) * steer_gain)
+                        rpm2 = base_rpm
+                    else:
+                        rpm1 = base_rpm
+                        rpm2 = base_rpm
+
+                    rpm1 = max(MIN_RPM, min(MAX_RPM, rpm1))
+                    rpm2 = max(MIN_RPM, min(MAX_RPM, rpm2))
+                    last_rpm1 = rpm1
+                    last_rpm2 = rpm2
+
+                    motor1.set_rpm(rpm1)
+                    motor2.set_rpm(rpm2)
+                    set_motors(True, True, MOVE_DIRECTION, MOVE_DIRECTION)
+                    print(f"[FOLLOWING] Mag: L={mag_left:4.0f} R={mag_right:4.0f} | Balance: {auto_balance:.3f} | Diff: {norm_diff:+.2f} | Bias: {steering_bias:+.2f} | RPM: L={rpm1:.1f} R={rpm2:.1f}")
+
+            elif state == "DOCKED":
+                if total_signal < CLOSE_SIGNAL and total_signal >= SIGNAL_THRESHOLD:
+                    state = "FOLLOWING"
+                    lost_signal_counter = 0
+                    log_message("Target moved away. Resuming follow.")
+                elif total_signal < SIGNAL_THRESHOLD:
+                    set_motors(False, False, 0, 0)
+                    log_message("Target lost while docked. Re-entering scan.")
+                    state = "SEARCHING"
+
+            await asyncio.sleep(0.1)
 
 async def main():
     if BOT_ROLE == 1:

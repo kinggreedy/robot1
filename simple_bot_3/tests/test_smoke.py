@@ -172,12 +172,14 @@ class TestFirmwareSmoke(unittest.TestCase):
         """Verify that baseline shift transients are detected and rejected, while steady-state beacons pass."""
         FS = code.FS
         N = code.N
+        cos_table = code.cos_table
+        sin_table = code.sin_table
         
-        # 1. Simulate a step transient (covering the bot: dropping from 4300 to 670 over 10 samples)
-        step_signal = [4300.0] * 40
+        # 1. Simulate a step transient (covering the bot: dropping from 40000 to 1000 over 10 samples)
+        step_signal = [40000.0] * 40
         for i in range(10):
-            step_signal.append(4300.0 - (4300.0 - 670.0) * (i / 10))
-        step_signal += [670.0] * 60
+            step_signal.append(40000.0 - (40000.0 - 1000.0) * (i / 10))
+        step_signal += [1000.0] * 60
         
         # Track transient flagging
         window = [32000.0] * N
@@ -191,8 +193,15 @@ class TestFirmwareSmoke(unittest.TestCase):
             mean_history.pop(0)
             mean_history.append(mean)
             
+            # Simulate local DFT to get magnitude
+            ac = [x - mean for x in window]
+            real = sum(x * c for x, c in zip(ac, cos_table))
+            imag = sum(x * s for x, s in zip(ac, sin_table))
+            mag = math.sqrt(real*real + imag*imag) / (N / 2)
+            
             # Replicate code.py transient check
-            is_transient = abs(mean - mean_history[0]) > 100.0
+            thresh = max(100.0, 0.2 * mag)
+            is_transient = abs(mean - mean_history[0]) > thresh
             transients.append(is_transient)
             
         # Verify that the transient was detected at some point during the drop
@@ -210,7 +219,16 @@ class TestFirmwareSmoke(unittest.TestCase):
             mean = sum(window_b) / N
             mean_history_b.pop(0)
             mean_history_b.append(mean)
-            is_transient = abs(mean - mean_history_b[0]) > 100.0
+            
+            # Simulate local DFT to get magnitude
+            ac = [x - mean for x in window_b]
+            real = sum(x * c for x, c in zip(ac, cos_table))
+            imag = sum(x * s for x, s in zip(ac, sin_table))
+            mag = math.sqrt(real*real + imag*imag) / (N / 2)
+            
+            # Replicate code.py transient check
+            thresh = max(100.0, 0.2 * mag)
+            is_transient = abs(mean - mean_history_b[0]) > thresh
             transients_b.append(is_transient)
             
         # After sample 60 (steady state), no transient should be flagged
